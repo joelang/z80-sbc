@@ -1,0 +1,340 @@
+;-------------------------------------------------------
+; 2nd. stage boot loader for z80-sbc
+; scsi-1  ncr5380 programmed i/o
+;
+;   j.c.lang 12/16/2017
+;-------------------------------------------------------
+	.page
+	.eject
+	.org $8000
+;
+bootdrv	.equ	2	;boot drive target ID
+bootlun	.equ	0	;boot drive LUN
+;
+nsects	.equ	13	;number of blocks
+ccp	.equ	$dc00	;cp/m ccp location
+bdos	.equ	$e406	;bdos location
+bios	.equ	$f200	;bios location
+
+;io port addresses
+;------------------------------------------------------------------------------
+uart    .equ    $80
+scsi    .equ    $88
+;
+;ncr 5380 i/o registers
+sr_csd	.equ	scsi
+sr_icr	.equ	scsi+$01
+sr_mr	.equ	scsi+$02
+sr_tcr	.equ	scsi+$03
+sr_csbs	.equ	scsi+$04
+sr_bsr	.equ	scsi+$05
+sr_idr	.equ	scsi+$06
+sr_rpi	.equ	scsi+$07
+;
+;ncr 5380 output only registers
+sr_odr	.equ	scsi
+sr_ser	.equ	scsi+$04
+sr_sds	.equ	scsi+$05
+sr_sdtr	.equ	scsi+$06
+sr_sdir	.equ	scsi+$07
+;
+;current bus status bit masks
+sm_rst	.equ	$80	;reset
+sm_bsy	.equ	$40	;busy
+sm_req	.equ	$20	;request
+sm_msg	.equ	$10	;message
+sm_cd	.equ	$08	;cmd/data
+sm_io	.equ	$04	;in/out
+sm_sel	.equ	$02	;select
+sm_dbp	.equ	$01	;
+;
+sm_phm	.equ	$08	;phase match bit
+;
+;------------------------------------------------------------------------------
+;cold start boot loader
+cboot:
+	ld sp,stack	;set stack space
+	ld ix,s_iot	;point to i/o table
+	call s_go	;do scsi i/o
+	and 02h		;mask to error bit
+	jp z,cpm_go	;goto cp/m
+	jp 0		;back to rom
+
+cpm_go:
+	ld A,00h	;
+	out (00h),a	;map out rom
+	ld A,02h	;drive=C:
+	jp bios		;cold start cp/m
+
+;-------------------------------------------------------------------------------
+;do scsi transaction
+; ix=scsi io block
+;-------------------------------------------------------------------------------
+s_go:
+	ld a,$ff	;preset error status
+	ld l,(ix+4)	;point to status address
+	ld h,(ix+5)	;point to status address
+	ld (hl),a	;set error
+;
+	xor a		;
+	out (sr_mr),a	;reset control reg
+	out (sr_tcr),a	;clear command reg.
+	out (sr_icr),a	;
+	ld a,(ix)	;get tid
+	out (sr_odr),a	;set target id
+	ld a,$01	;drive bus
+	out (sr_icr),a	;
+	ld a,$05	;set sel and drive bus
+	out (sr_icr),a	;
+;
+;wait for scsi busy
+	ld bc,0		;init timeout
+s_swt:
+	in a,(sr_csbs)	;get bus status
+	and sm_bsy	;mask to busy bit
+	jr nz,s_bsya	;jmp if busy active
+	dec bc		;dec timeout
+	ld a,b		;test timeout=0
+	or c
+	jr nz,s_swt	;jmp if no timeout
+	xor a		;clear a
+	out (sr_icr),a	;clear sel and data
+	jr s_exit	;error exit
+;
+;busy is active
+s_bsya:
+	xor a		;clear a
+	out (sr_icr),a	;clear sel and data
+
+;-------------------------------------------------------------------------------
+;
+;target is selected so test bsy and req
+;then decode requested phase
+;
+;-------------------------------------------------------------------------------
+phase:
+	xor a
+	out (sr_icr),a	;reset initiator
+;
+s_wtreq:
+	in a,(sr_csbs)	;get bus status
+	ld b,a		;save copy
+	and sm_bsy	;mask to busy bit
+	jr nz,s_wtrq1	;still busy so cont.
+
+;-------------------------------------------------------------------------------
+;busy lost so exit
+;-------------------------------------------------------------------------------
+s_exit:
+	ld l,(ix+4)	;get status pointer
+	ld h,(ix+5)	;get status pointer
+	ld a,(hl)
+	ret		;busy lost? were done
+
+;-------------------------------------------------------------------------------
+;check request loop if not active
+;-------------------------------------------------------------------------------
+s_wtrq1:
+	ld a,b		;recover status
+	and sm_req	;request active?
+	jr z,s_wtreq	;loop till request
+
+;-------------------------------------------------------------------------------
+;request is active so set 5380 to requested phase
+;-------------------------------------------------------------------------------
+	ld a,b		;recover bus status
+	rr a
+	rr a
+	and $07		;mask to phase bits
+	out (sr_tcr),a	;set phase
+;
+;jump to phase handler
+;
+	ld a,b		;recover bus status 
+	rr a
+	and $0e		;mask to phase bits
+	ld e,a
+	ld d,0
+	ld hl,phtabl	;point to table
+	add hl,de	;offset into table
+	ld e,(hl)
+	inc hl
+	ld d,(hl)
+	push de
+	ret		;execute phase
+
+;-------------------------------------------------------------------------------
+;phase table
+;-------------------------------------------------------------------------------
+phtabl:
+	.word	phase0	;data out
+	.word	phase1	;data in
+	.word	phase2	;cmd out
+	.word	phase3	;status in
+	.word	s_exit	;unused
+	.word	s_exit	;unused
+	.word	phase6	;message out
+	.word	phase7	;message in
+
+;-------------------------------------------------------------------------------
+;phase handlers
+;-------------------------------------------------------------------------------
+;
+;data out
+phase0:
+	ld l,(ix+6)
+	ld h,(ix+7)
+	jp s_writ
+;
+;data in
+phase1:
+	ld l,(ix+8)
+	ld h,(ix+9)
+	jp s_read
+;
+;cmd out
+phase2:
+	ld l,(ix+2)
+	ld h,(ix+3)
+	jp s_writ
+;
+;status in
+phase3:
+	ld l,(ix+4)
+	ld h,(ix+5)
+	jp s_read
+;
+;msg out
+phase6:
+	ld l,(ix+10)
+	ld h,(ix+11)
+	jp s_writ
+;
+;msg in
+phase7:
+	ld l,(ix+12)
+	ld h,(ix+13)
+	jp s_read
+
+;-------------------------------------------------------------------------------
+;scsi write routine (send bytes to target)
+;-------------------------------------------------------------------------------
+s_writ:
+	ld a,1		;drive scsi data
+	out (sr_icr),a
+;
+;wait for req while checking busy
+;
+s_wwreq:
+        in a,(sr_csbs)  ;get current bus stat
+        ld b,a          ;save it
+        and sm_req      ;request active?
+        jr nz,s_wnxt    ;
+;
+        ld a,b          ;recover current bus stat
+        and sm_bsy      ;still busy?
+        jp nz,s_wwreq   ;loop if stil busy
+        jp phase        ;
+;
+;request active so check phase
+;
+s_wnxt:
+        in a,(sr_bsr)   ;get status
+        and sm_phm      ;mask to phase match
+        jp z,phase      ;jmp if phase mismatch
+;
+;request active and phase match so send data
+;
+	ld a,(hl)	;get byte
+	out (sr_odr),a	;send data
+	ld a,$11	;ack and data
+	out (sr_icr),a	;set ack,drive scsi bus
+	inc hl
+;
+;wait for request to drop
+;
+s_wnreq:
+	in a,(sr_csbs)	;get current status
+	and sm_req
+	jr nz,s_wnreq	;loop till req drops
+;
+	ld a,$1		;drop ack,assert data
+	out (sr_icr),a	;drop ack
+	jp s_wwreq	;loop for next byte/phase
+
+;-------------------------------------------------------------------------------
+;scsi read routine (get bytes from target)
+;-------------------------------------------------------------------------------
+;
+s_read:
+;
+;wait for req while checking busy
+;
+s_rwreq:
+        in a,(sr_csbs)  ;get current bus stat
+        ld b,a          ;save it
+        and sm_req      ;request active?
+        jr nz,s_rnxt    ;
+;
+        ld a,b          ;recover current bus stat
+        and sm_bsy      ;still busy?
+        jp nz,s_rwreq   ;loop if stil busy
+        jp phase        ;
+;
+;request active so check phase
+s_rnxt:
+        in a,(sr_bsr)   ;get status
+        and sm_phm      ;mask to phase match
+        jp z,phase      ;jmp if phase mismatch
+
+;
+;request active and phase match so get data
+;
+	in a, (sr_csd)	;get data
+	ld (hl),a	;save data
+	ld a,$10
+	out (sr_icr),a	;set ack
+	inc hl		;advance buf pointer
+;
+;wait for request to drop
+;
+s_rnreq:
+	in a,(sr_csbs)	;get current status
+	and sm_req
+	jr nz,s_rnreq	;loop till req drops
+	xor a
+	out (sr_icr),a	;drop ack
+	jp s_read	;loop for next byte/phase
+
+;
+;-------------------------------------------------------
+;command descriptor block
+;-------------------------------------------------------
+s_cdb:
+	.db	8	;read command
+	.db	bootlun	;lun
+	.db	0	;lbn hi
+	.db	1	;lbn low
+	.db	nsects	;block count
+	.db	0	;flags
+
+;-------------------------------------------------------
+;scsi i/o table
+;-------------------------------------------------------
+s_iot:
+	.db	bootdrv	;target
+	.db	0	;unused
+	.dw	s_cdb	;cdb pointer
+	.dw	s_stat	;status pointer
+	.dw	ccp	;data out pointer
+	.dw	ccp	;data in pointer
+	.dw	s_msg	;msg out pointer
+	.dw	s_msg	;msg in pointer
+
+s_stat:	.ds 2		;status
+s_msg:	.ds 2		;message
+
+	.ds 128	;reserve stack space
+stack	.equ $
+	.end
+

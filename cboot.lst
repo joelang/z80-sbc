@@ -1,0 +1,359 @@
+0001   0000             ;-------------------------------------------------------
+0002   0000             ; 2nd. stage boot loader for z80-sbc
+0003   0000             ; scsi-1  ncr5380 programmed i/o
+0004   0000             ;
+0005   0000             ;   j.c.lang 12/16/2017
+0006   0000             ;-------------------------------------------------------
+0007   0000             	.page
+TASM Z80 Assembler.               cboot.z80                        page 1
+Speech Technology Incorporated.   
+
+0008   0000             	.eject
+0009   8000             	.org $8000
+0010   8000             ;
+0011   8000             bootdrv	.equ	2	;boot drive target ID
+0012   8000             bootlun	.equ	0	;boot drive LUN
+0013   8000             ;
+0014   8000             nsects	.equ	13	;number of blocks
+0015   8000             ccp	.equ	$dc00	;cp/m ccp location
+0016   8000             bdos	.equ	$e406	;bdos location
+0017   8000             bios	.equ	$f200	;bios location
+0018   8000             
+0019   8000             ;io port addresses
+0020   8000             ;------------------------------------------------------------------------------
+0021   8000             uart    .equ    $80
+0022   8000             scsi    .equ    $88
+0023   8000             ;
+0024   8000             ;ncr 5380 i/o registers
+0025   8000             sr_csd	.equ	scsi
+0026   8000             sr_icr	.equ	scsi+$01
+0027   8000             sr_mr	.equ	scsi+$02
+0028   8000             sr_tcr	.equ	scsi+$03
+0029   8000             sr_csbs	.equ	scsi+$04
+0030   8000             sr_bsr	.equ	scsi+$05
+0031   8000             sr_idr	.equ	scsi+$06
+0032   8000             sr_rpi	.equ	scsi+$07
+0033   8000             ;
+0034   8000             ;ncr 5380 output only registers
+0035   8000             sr_odr	.equ	scsi
+0036   8000             sr_ser	.equ	scsi+$04
+0037   8000             sr_sds	.equ	scsi+$05
+0038   8000             sr_sdtr	.equ	scsi+$06
+0039   8000             sr_sdir	.equ	scsi+$07
+0040   8000             ;
+0041   8000             ;current bus status bit masks
+0042   8000             sm_rst	.equ	$80	;reset
+0043   8000             sm_bsy	.equ	$40	;busy
+0044   8000             sm_req	.equ	$20	;request
+0045   8000             sm_msg	.equ	$10	;message
+0046   8000             sm_cd	.equ	$08	;cmd/data
+0047   8000             sm_io	.equ	$04	;in/out
+0048   8000             sm_sel	.equ	$02	;select
+0049   8000             sm_dbp	.equ	$01	;
+0050   8000             ;
+0051   8000             sm_phm	.equ	$08	;phase match bit
+0052   8000             ;
+0053   8000             ;------------------------------------------------------------------------------
+0054   8000             ;cold start boot loader
+0055   8000             cboot:
+0056   8000 31 B8 81    	ld sp,stack	;set stack space
+0057   8003 DD 21 26 81 	ld ix,s_iot	;point to i/o table
+0058   8007 CD 1B 80    	call s_go	;do scsi i/o
+0059   800A E6 02       	and 02h		;mask to error bit
+0060   800C CA 12 80    	jp z,cpm_go	;goto cp/m
+0061   800F C3 00 00    	jp 0		;back to rom
+0062   8012             
+0063   8012             cpm_go:
+0064   8012 3E 00       	ld A,00h	;
+0065   8014 D3 00       	out (00h),a	;map out rom
+0066   8016 3E 02       	ld A,02h	;drive=C:
+TASM Z80 Assembler.               cboot.z80                        page 2
+Speech Technology Incorporated.   
+
+0067   8018 C3 00 F2    	jp bios		;cold start cp/m
+0068   801B             
+0069   801B             ;-------------------------------------------------------------------------------
+0070   801B             ;do scsi transaction
+0071   801B             ; ix=scsi io block
+0072   801B             ;-------------------------------------------------------------------------------
+0073   801B             s_go:
+0074   801B 3E FF       	ld a,$ff	;preset error status
+0075   801D DD 6E 04    	ld l,(ix+4)	;point to status address
+0076   8020 DD 66 05    	ld h,(ix+5)	;point to status address
+0077   8023 77          	ld (hl),a	;set error
+0078   8024             ;
+0079   8024 AF          	xor a		;
+0080   8025 D3 8A       	out (sr_mr),a	;reset control reg
+0081   8027 D3 8B       	out (sr_tcr),a	;clear command reg.
+0082   8029 D3 89       	out (sr_icr),a	;
+0083   802B DD 7E 00    	ld a,(ix)	;get tid
+0084   802E D3 88       	out (sr_odr),a	;set target id
+0085   8030 3E 01       	ld a,$01	;drive bus
+0086   8032 D3 89       	out (sr_icr),a	;
+0087   8034 3E 05       	ld a,$05	;set sel and drive bus
+0088   8036 D3 89       	out (sr_icr),a	;
+0089   8038             ;
+0090   8038             ;wait for scsi busy
+0091   8038 01 00 00    	ld bc,0		;init timeout
+0092   803B             s_swt:
+0093   803B DB 8C       	in a,(sr_csbs)	;get bus status
+0094   803D E6 40       	and sm_bsy	;mask to busy bit
+0095   803F 20 0A       	jr nz,s_bsya	;jmp if busy active
+0096   8041 0B          	dec bc		;dec timeout
+0097   8042 78          	ld a,b		;test timeout=0
+0098   8043 B1          	or c
+0099   8044 20 F5       	jr nz,s_swt	;jmp if no timeout
+0100   8046 AF          	xor a		;clear a
+0101   8047 D3 89       	out (sr_icr),a	;clear sel and data
+0102   8049 18 0D       	jr s_exit	;error exit
+0103   804B             ;
+0104   804B             ;busy is active
+0105   804B             s_bsya:
+0106   804B AF          	xor a		;clear a
+0107   804C D3 89       	out (sr_icr),a	;clear sel and data
+0108   804E             
+0109   804E             ;-------------------------------------------------------------------------------
+0110   804E             ;
+0111   804E             ;target is selected so test bsy and req
+0112   804E             ;then decode requested phase
+0113   804E             ;
+0114   804E             ;-------------------------------------------------------------------------------
+0115   804E             phase:
+0116   804E AF          	xor a
+0117   804F D3 89       	out (sr_icr),a	;reset initiator
+0118   8051             ;
+0119   8051             s_wtreq:
+0120   8051 DB 8C       	in a,(sr_csbs)	;get bus status
+0121   8053 47          	ld b,a		;save copy
+0122   8054 E6 40       	and sm_bsy	;mask to busy bit
+0123   8056 20 08       	jr nz,s_wtrq1	;still busy so cont.
+0124   8058             
+0125   8058             ;-------------------------------------------------------------------------------
+TASM Z80 Assembler.               cboot.z80                        page 3
+Speech Technology Incorporated.   
+
+0126   8058             ;busy lost so exit
+0127   8058             ;-------------------------------------------------------------------------------
+0128   8058             s_exit:
+0129   8058 DD 6E 04    	ld l,(ix+4)	;get status pointer
+0130   805B DD 66 05    	ld h,(ix+5)	;get status pointer
+0131   805E 7E          	ld a,(hl)
+0132   805F C9          	ret		;busy lost? were done
+0133   8060             
+0134   8060             ;-------------------------------------------------------------------------------
+0135   8060             ;check request loop if not active
+0136   8060             ;-------------------------------------------------------------------------------
+0137   8060             s_wtrq1:
+0138   8060 78          	ld a,b		;recover status
+0139   8061 E6 20       	and sm_req	;request active?
+0140   8063 28 EC       	jr z,s_wtreq	;loop till request
+0141   8065             
+0142   8065             ;-------------------------------------------------------------------------------
+0143   8065             ;request is active so set 5380 to requested phase
+0144   8065             ;-------------------------------------------------------------------------------
+0145   8065 78          	ld a,b		;recover bus status
+0146   8066 CB 1F       	rr a
+0147   8068 CB 1F       	rr a
+0148   806A E6 07       	and $07		;mask to phase bits
+0149   806C D3 8B       	out (sr_tcr),a	;set phase
+0150   806E             ;
+0151   806E             ;jump to phase handler
+0152   806E             ;
+0153   806E 78          	ld a,b		;recover bus status 
+0154   806F CB 1F       	rr a
+0155   8071 E6 0E       	and $0e		;mask to phase bits
+0156   8073 5F          	ld e,a
+0157   8074 16 00       	ld d,0
+0158   8076 21 7F 80    	ld hl,phtabl	;point to table
+0159   8079 19          	add hl,de	;offset into table
+0160   807A 5E          	ld e,(hl)
+0161   807B 23          	inc hl
+0162   807C 56          	ld d,(hl)
+0163   807D D5          	push de
+0164   807E C9          	ret		;execute phase
+0165   807F             
+0166   807F             ;-------------------------------------------------------------------------------
+0167   807F             ;phase table
+0168   807F             ;-------------------------------------------------------------------------------
+0169   807F             phtabl:
+0170   807F 8F 80       	.word	phase0	;data out
+0171   8081 98 80       	.word	phase1	;data in
+0172   8083 A1 80       	.word	phase2	;cmd out
+0173   8085 AA 80       	.word	phase3	;status in
+0174   8087 58 80       	.word	s_exit	;unused
+0175   8089 58 80       	.word	s_exit	;unused
+0176   808B B3 80       	.word	phase6	;message out
+0177   808D BC 80       	.word	phase7	;message in
+0178   808F             
+0179   808F             ;-------------------------------------------------------------------------------
+0180   808F             ;phase handlers
+0181   808F             ;-------------------------------------------------------------------------------
+0182   808F             ;
+0183   808F             ;data out
+0184   808F             phase0:
+TASM Z80 Assembler.               cboot.z80                        page 4
+Speech Technology Incorporated.   
+
+0185   808F DD 6E 06    	ld l,(ix+6)
+0186   8092 DD 66 07    	ld h,(ix+7)
+0187   8095 C3 C5 80    	jp s_writ
+0188   8098             ;
+0189   8098             ;data in
+0190   8098             phase1:
+0191   8098 DD 6E 08    	ld l,(ix+8)
+0192   809B DD 66 09    	ld h,(ix+9)
+0193   809E C3 F5 80    	jp s_read
+0194   80A1             ;
+0195   80A1             ;cmd out
+0196   80A1             phase2:
+0197   80A1 DD 6E 02    	ld l,(ix+2)
+0198   80A4 DD 66 03    	ld h,(ix+3)
+0199   80A7 C3 C5 80    	jp s_writ
+0200   80AA             ;
+0201   80AA             ;status in
+0202   80AA             phase3:
+0203   80AA DD 6E 04    	ld l,(ix+4)
+0204   80AD DD 66 05    	ld h,(ix+5)
+0205   80B0 C3 F5 80    	jp s_read
+0206   80B3             ;
+0207   80B3             ;msg out
+0208   80B3             phase6:
+0209   80B3 DD 6E 0A    	ld l,(ix+10)
+0210   80B6 DD 66 0B    	ld h,(ix+11)
+0211   80B9 C3 C5 80    	jp s_writ
+0212   80BC             ;
+0213   80BC             ;msg in
+0214   80BC             phase7:
+0215   80BC DD 6E 0C    	ld l,(ix+12)
+0216   80BF DD 66 0D    	ld h,(ix+13)
+0217   80C2 C3 F5 80    	jp s_read
+0218   80C5             
+0219   80C5             ;-------------------------------------------------------------------------------
+0220   80C5             ;scsi write routine (send bytes to target)
+0221   80C5             ;-------------------------------------------------------------------------------
+0222   80C5             s_writ:
+0223   80C5 3E 01       	ld a,1		;drive scsi data
+0224   80C7 D3 89       	out (sr_icr),a
+0225   80C9             ;
+0226   80C9             ;wait for req while checking busy
+0227   80C9             ;
+0228   80C9             s_wwreq:
+0229   80C9 DB 8C               in a,(sr_csbs)  ;get current bus stat
+0230   80CB 47                  ld b,a          ;save it
+0231   80CC E6 20               and sm_req      ;request active?
+0232   80CE 20 09               jr nz,s_wnxt    ;
+0233   80D0             ;
+0234   80D0 78                  ld a,b          ;recover current bus stat
+0235   80D1 E6 40               and sm_bsy      ;still busy?
+0236   80D3 C2 C9 80            jp nz,s_wwreq   ;loop if stil busy
+0237   80D6 C3 4E 80            jp phase        ;
+0238   80D9             ;
+0239   80D9             ;request active so check phase
+0240   80D9             ;
+0241   80D9             s_wnxt:
+0242   80D9 DB 8D               in a,(sr_bsr)   ;get status
+0243   80DB E6 08               and sm_phm      ;mask to phase match
+TASM Z80 Assembler.               cboot.z80                        page 5
+Speech Technology Incorporated.   
+
+0244   80DD CA 4E 80            jp z,phase      ;jmp if phase mismatch
+0245   80E0             ;
+0246   80E0             ;request active and phase match so send data
+0247   80E0             ;
+0248   80E0 7E          	ld a,(hl)	;get byte
+0249   80E1 D3 88       	out (sr_odr),a	;send data
+0250   80E3 3E 11       	ld a,$11	;ack and data
+0251   80E5 D3 89       	out (sr_icr),a	;set ack,drive scsi bus
+0252   80E7 23          	inc hl
+0253   80E8             ;
+0254   80E8             ;wait for request to drop
+0255   80E8             ;
+0256   80E8             s_wnreq:
+0257   80E8 DB 8C       	in a,(sr_csbs)	;get current status
+0258   80EA E6 20       	and sm_req
+0259   80EC 20 FA       	jr nz,s_wnreq	;loop till req drops
+0260   80EE             ;
+0261   80EE 3E 01       	ld a,$1		;drop ack,assert data
+0262   80F0 D3 89       	out (sr_icr),a	;drop ack
+0263   80F2 C3 C9 80    	jp s_wwreq	;loop for next byte/phase
+0264   80F5             
+0265   80F5             ;-------------------------------------------------------------------------------
+0266   80F5             ;scsi read routine (get bytes from target)
+0267   80F5             ;-------------------------------------------------------------------------------
+0268   80F5             ;
+0269   80F5             s_read:
+0270   80F5             ;
+0271   80F5             ;wait for req while checking busy
+0272   80F5             ;
+0273   80F5             s_rwreq:
+0274   80F5 DB 8C               in a,(sr_csbs)  ;get current bus stat
+0275   80F7 47                  ld b,a          ;save it
+0276   80F8 E6 20               and sm_req      ;request active?
+0277   80FA 20 09               jr nz,s_rnxt    ;
+0278   80FC             ;
+0279   80FC 78                  ld a,b          ;recover current bus stat
+0280   80FD E6 40               and sm_bsy      ;still busy?
+0281   80FF C2 F5 80            jp nz,s_rwreq   ;loop if stil busy
+0282   8102 C3 4E 80            jp phase        ;
+0283   8105             ;
+0284   8105             ;request active so check phase
+0285   8105             s_rnxt:
+0286   8105 DB 8D               in a,(sr_bsr)   ;get status
+0287   8107 E6 08               and sm_phm      ;mask to phase match
+0288   8109 CA 4E 80            jp z,phase      ;jmp if phase mismatch
+0289   810C             
+0290   810C             ;
+0291   810C             ;request active and phase match so get data
+0292   810C             ;
+0293   810C DB 88       	in a, (sr_csd)	;get data
+0294   810E 77          	ld (hl),a	;save data
+0295   810F 3E 10       	ld a,$10
+0296   8111 D3 89       	out (sr_icr),a	;set ack
+0297   8113 23          	inc hl		;advance buf pointer
+0298   8114             ;
+0299   8114             ;wait for request to drop
+0300   8114             ;
+0301   8114             s_rnreq:
+0302   8114 DB 8C       	in a,(sr_csbs)	;get current status
+TASM Z80 Assembler.               cboot.z80                        page 6
+Speech Technology Incorporated.   
+
+0303   8116 E6 20       	and sm_req
+0304   8118 20 FA       	jr nz,s_rnreq	;loop till req drops
+0305   811A AF          	xor a
+0306   811B D3 89       	out (sr_icr),a	;drop ack
+0307   811D C3 F5 80    	jp s_read	;loop for next byte/phase
+0308   8120             
+0309   8120             ;
+0310   8120             ;-------------------------------------------------------
+0311   8120             ;command descriptor block
+0312   8120             ;-------------------------------------------------------
+0313   8120             s_cdb:
+0314   8120 08          	.db	8	;read command
+0315   8121 00          	.db	bootlun	;lun
+0316   8122 00          	.db	0	;lbn hi
+0317   8123 01          	.db	1	;lbn low
+0318   8124 0D          	.db	nsects	;block count
+0319   8125 00          	.db	0	;flags
+0320   8126             
+0321   8126             ;-------------------------------------------------------
+0322   8126             ;scsi i/o table
+0323   8126             ;-------------------------------------------------------
+0324   8126             s_iot:
+0325   8126 02          	.db	bootdrv	;target
+0326   8127 00          	.db	0	;unused
+0327   8128 20 81       	.dw	s_cdb	;cdb pointer
+0328   812A 34 81       	.dw	s_stat	;status pointer
+0329   812C 00 DC       	.dw	ccp	;data out pointer
+0330   812E 00 DC       	.dw	ccp	;data in pointer
+0331   8130 36 81       	.dw	s_msg	;msg out pointer
+0332   8132 36 81       	.dw	s_msg	;msg in pointer
+0333   8134             
+0334   8134             s_stat:	.ds 2		;status
+0335   8136             s_msg:	.ds 2		;message
+0336   8138             
+0337   8138             	.ds 128	;reserve stack space
+0338   81B8             stack	.equ $
+0339   81B8             	.end
+0340   81B8             
+tasm: Number of errors = 0

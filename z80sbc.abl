@@ -1,0 +1,30 @@
+module decoder
+
+title 'ADDRESS DECODER z80 sbc
+JOSEPH LANG  04 JUL 2020'
+
+	sbc-u4	device 'P16V8C';
+
+	WR,RD,MREQ PIN 1,2,3;
+	IORQ,RESET PIN 4,5;
+	A7,A15,A14,A13 PIN 6,7,8,9;
+	CSROM PIN 18;
+	CSRAM PIN 17;
+	MAP PIN 16;
+
+	X = .X.;
+
+equations
+	MAP = !RESET & MAP #
+		!WR & !A7 & !IORQ;
+
+        !CSROM = !A15 & !A14 & !A13 & !MREQ & !MAP;
+
+	!CSRAM = !A15 & !A14 & !A13 & !MREQ & MAP #
+		!A15 & !A14 & A13 & !MREQ #             
+		!A15 & A14 & !A13 & !MREQ #             
+		!A15 & A14 & A13 & !MREQ #
+		A15 & !MREQ ;
+
+	       
+end decoder

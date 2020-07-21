@@ -1,0 +1,1295 @@
+0001   0000             ;==============================================================================
+0002   0000             ; Z80 CPU Monitor Rom 
+0003   0000             ; NCR5380 SCSI NS16550 serial
+0004   0000             ; This doesn't use any features of the 16550
+0005   0000             ; So a 8250 should work ok
+0006   0000             ;
+0007   0000             ; J.C.LANG 12/15/2017
+0008   0000             ; 07/04/2020 changed equates for z80-sbc
+0009   0000             ;==============================================================================
+0010   0000             ROM	.equ	$0
+0011   0000             RAM	.equ	$FE00
+0012   0000             ;------------------------------------------------------------------------------
+0013   0000             ;IO port addresses
+0014   0000             ;------------------------------------------------------------------------------
+0015   0000             UART    .equ    $80
+0016   0000             SCSI    .equ    $88
+0017   0000             ;
+0018   0000             ;NCR 5380 I/O REGISTERS
+0019   0000             SR_CSD	.EQU	SCSI
+0020   0000             SR_ICR	.EQU	SCSI+$01
+0021   0000             SR_MR	.EQU	SCSI+$02
+0022   0000             SR_TCR	.EQU	SCSI+$03
+0023   0000             SR_CSBS	.EQU	SCSI+$04
+0024   0000             SR_BSR	.EQU	SCSI+$05
+0025   0000             SR_IDR	.EQU	SCSI+$06
+0026   0000             SR_RPI	.EQU	SCSI+$07
+0027   0000             ;
+0028   0000             ;NCR 5380 OUTPUT ONLY REGISTERS
+0029   0000             SR_ODR	.EQU	SCSI
+0030   0000             SR_SER	.EQU	SCSI+$04
+0031   0000             SR_SDS	.EQU	SCSI+$05
+0032   0000             SR_SDTR	.EQU	SCSI+$06
+0033   0000             SR_SDIR	.EQU	SCSI+$07
+0034   0000             ;
+0035   0000             ;CURRENT BUS STATUS BIT MASKS
+0036   0000             SM_RST	.EQU	$80	;reset
+0037   0000             SM_BSY	.EQU	$40	;busy
+0038   0000             SM_REQ	.EQU	$20	;request
+0039   0000             SM_MSG	.EQU	$10	;message
+0040   0000             SM_CD	.EQU	$08	;cmd/data
+0041   0000             SM_IO	.EQU	$04	;in/out
+0042   0000             SM_SEL	.EQU	$02	;select
+0043   0000             SM_DBP	.EQU	$01	;
+0044   0000             ;
+0045   0000             SM_PHM	.EQU	$08	;phase match bit
+0046   0000             ;
+0047   0000             ;------------------------------------------------------------------------------
+0048   0000             ;MONITOR RAM LOCATIONS
+0049   0000             ;------------------------------------------------------------------------------
+0050   8000             	.ORG	$8000
+0051   8000             ;
+0052   8000             ;2nd. stage boot loader location
+0053   8000             ;default SCSI data buffer for test routines
+0054   8000             SCBUFF	.DS 512	;
+0055   8200             ;
+0056   FE00             	.ORG	RAM	;start of RAM
+0057   FE00             STACK	.equ RAM-1	;top of stack location
+0058   FE00             ;
+0059   FE00             SCCDB	.DS 12	;SCSI command block
+0060   FE0C             ;
+0061   FE0C             ;SCSI IO pointer table
+0062   FE0C             SCIOT	.DS 1	;SCSI target ID
+0063   FE0D             	.DS 1	;spare (future LUN?)
+0064   FE0E             	.DS 2	;CDB pointer
+0065   FE10             	.DS 2	;STATUS pointer
+0066   FE12             	.DS 2	;DATA OUT pointer
+0067   FE14             	.DS 2	;DATA IN pointer
+0068   FE16             	.DS 2	;MSG OUT pointer
+0069   FE18             	.DS 2	;MSG IN pointer
+0070   FE1A             ;
+0071   FE1A             SCMSGI	.DS 2	;SCSI message in buffer
+0072   FE1C             SCMSGO	.DS 2	;SCSI message out buffer
+0073   FE1E             SCSTAT	.DS 2	;SCSI ending status buffer
+0074   FE20             BKPTR	.DS 2	;save breakpoint address
+0075   FE22             BKDATA	.DS 1	;save old breakpoint data
+0076   FE23             
+0077   FE23             
+0078   0000             	.ORG ROM
+0079   0000             ;------------------------------------------------------------------------------
+0080   0000             ; Cold bootup sequence
+0081   0000             ;------------------------------------------------------------------------------
+0082   0000 31 FF FD    COLDST  LD   SP,STACK           ; SP near top of SRam   
+0083   0003 CD 60 05    	CALL HINIT              ; Initialize hardware   
+0084   0006 FF          	RST  38H                ; Push all registers on stack, prompt   
+0085   0007             ;
+0086   0007 FF          	.DB	$FF             ; filler
+0087   0008             
+0088   0008             ;------------------------------------------------------------------------------
+0089   0008             ; RST 08 - Transmit a character in A
+0090   0008             ;------------------------------------------------------------------------------
+0091   0008 F5          TX_CH   PUSH AF                 ; TX Char in A to RS232 
+0092   0009 DF          TX_CLOP RST  18H                ; Ck status of SIO      
+0093   000A 30 FD       	JR   NC,TX_CLOP         ; Ck Carry flag until TX buffer is clear
+0094   000C F1          	POP  AF                 ; Get original Character back   
+0095   000D D3 80       	OUT  (UART),A           ; And out it to the SIO
+0096   000F C9          	RET
+0097   0010             
+0098   0010             ;-------------------------------------------------------------------------------
+0099   0010             ; RST 10 - Read a character into A
+0100   0010             ;-------------------------------------------------------------------------------
+0101   0010 DF          RX_CH   RST  18H                ; RX Char from RS232 to A       
+0102   0011 28 FD       	JR   Z,RX_CH            ; Ck Zero Flag and loop until Char is in        
+0103   0013 DB 80       	IN   A,(UART)           ; Get Character into A
+0104   0015 E6 7F       	AND  $7F                ; Strip off the top bit D7 (0111 1111)
+0105   0017 C9          	RET
+0106   0018             
+0107   0018             ;-------------------------------------------------------------------------------
+0108   0018             ; RST 18 - Check SIO status
+0109   0018             ;-------------------------------------------------------------------------------
+0110   0018 DB 85       UARTST  IN   A,(UART+5)         ; Status byte D0=TX Empty, D1=RX ready 
+0111   001A 07          	RLCA                    ; Rotates TX status into Carry Flag,    
+0112   001B 07          	RLCA                    ; Rotates TX status into Carry Flag,    
+0113   001C 07          	RLCA                    ; Rotates TX status into Carry Flag,    
+0114   001D CB 5F       	BIT  3,A                ; Set Zero flag if RXdata not available 
+0115   001F C9          	RET 
+0116   0020             
+0117   0020             ;-------------------------------------------------------------------------------
+0118   0020             ; RST 20        - does not function as a restart
+0119   0020             ;-------------------------------------------------------------------------------
+0120   0020 C9          	RET
+0121   0021             
+0122   0021             ;-------------------------------------------------------------------------------
+0123   0021             ; Get character and echo to console
+0124   0021             ;-------------------------------------------------------------------------------
+0125   0021 D7          GETCHE  RST  10H                ; Loops a character in, RX Char 
+0126   0022 18 E4       	JR   TX_CH              ; echo character
+0127   0024             
+0128   0024             ;-------------------------------------------------------------------------------
+0129   0024             ; Pop all registers from stack and return to user code		
+0130   0024             ;-------------------------------------------------------------------------------
+0131   0024 E1          EXIT    POP  HL			; discard return address
+0132   0025 E1          	POP  HL			; pop all registers
+0133   0026 D1          	POP  DE
+0134   0027 C1          	POP  BC
+0135   0028 F1          	POP  AF
+0136   0029 08          	EX   AF,AF'
+0137   002A D9          	EXX
+0138   002B FD E1       	POP  IY
+0139   002D DD E1       	POP  IX
+0140   002F E1          	POP  HL
+0141   0030 D1          	POP  DE
+0142   0031 C1          	POP  BC
+0143   0032 F1          	POP  AF
+0144   0033 FB          	EI                      ; Enable INT
+0145   0034 C9          	RET                     ; return to user routine
+0146   0035             				; address on stack set by "GO"
+0147   0035             
+0148   0038             	.org ROM+$38
+0149   0038             ;-------------------------------------------------------------------------------
+0150   0038             ; RST 38 - INTERRUPT VECTOR [ for IM 1 ]
+0151   0038             ; Push all registers on stack and goto command loop
+0152   0038             ;-------------------------------------------------------------------------------
+0153   0038 F3          RST38   DI                      ; Breakpoint, Disable Interrupts        
+0154   0039 F5          	PUSH AF                 ; And Push all registers on Stack       
+0155   003A C5          	PUSH BC
+0156   003B D5          	PUSH DE                         
+0157   003C E5          	PUSH HL                         
+0158   003D DD E5       	PUSH IX                         
+0159   003F FD E5       	PUSH IY                         
+0160   0041 D9          	EXX                     ; Push the alternate registers also
+0161   0042 08          	EX   AF,AF'                     
+0162   0043 F5          	PUSH AF                         
+0163   0044 C5          	PUSH BC                         
+0164   0045 D5          	PUSH DE                         
+0165   0046 E5          	PUSH HL
+0166   0047 CD 8D 02    	CALL SIGNON             ; Print "SBC Monitor VX.X"      
+0167   004A 18 26       	JR   ENTRY              ; and Enter the Monitor at Prompt       
+0168   004C             
+0169   004C             ;-------------------------------------------------------------------------------
+0170   004C             ; Print a space on console
+0171   004C             ;-------------------------------------------------------------------------------
+0172   004C 3E 20       PR_SPC  LD   A,$20              ; TX a <spc> out the RS232      
+0173   004E 18 B8       	JR   TX_CH
+0174   0050             
+0175   0050             ;-------------------------------------------------------------------------------
+0176   0050             ; Memory Test JXXXX,YYYY
+0177   0050             ;-------------------------------------------------------------------------------
+0178   0050 CD 01 03    MEMTST  CALL GET2ADR            ; Get XXXX to DE,YYYY to HL from user   
+0179   0053 D8          	RET  C                  ; on Carry <Ctrl-C> was hit, cancel.    
+0180   0054 EB          	EX   DE,HL              ; Swap start, ending address
+0181   0055 7E          MEMT01  LD   A,(HL)             ; Get byte from starting address        
+0182   0056 47          	LD   B,A                ; Save it       
+0183   0057 2F          	CPL                     ; Invert all 1's, 0's   
+0184   0058 77          	LD   (HL),A             ; Write it back 
+0185   0059 AE          	XOR  (HL)               ; Get logical difference        
+0186   005A C2 7C 02    	JP   NZ,PRTMEM          ; Write it out if there's a problem     
+0187   005D 70          	LD   (HL),B             ; else, restore the original byte       
+0188   005E CD 68 00    	CALL CPHLDE             ; Check if HL=DE, Zero if =     
+0189   0061 23          	INC  HL                 ; Next location 
+0190   0062 20 F1       	JR   NZ,MEMT01          ; HL<>DE, repeat the process    
+0191   0064 C9          	RET                     ; and get back to the prompt   
+0192   0065              
+0193   0066             	.org ROM+$66
+0194   0066             ;-------------------------------------------------------------------------------
+0195   0066             ; [NMI VECTOR]
+0196   0066             ; The NMI signal can cause a program to break and save all its register values
+0197   0066             ; The INT signal would work the same if the processor is put into IM 1
+0198   0066             ;-------------------------------------------------------------------------------
+0199   0066 18 D0       RST66   JR   RST38              ; Just play like it's an INT in IM 1
+0200   0068             
+0201   0068             ;-------------------------------------------------------------------------------
+0202   0068             ; CPHLDE Compare HL and DE
+0203   0068             ;-------------------------------------------------------------------------------
+0204   0068 7C          CPHLDE  LD   A,H                ;
+0205   0069 BA          	CP   D			; compare H D
+0206   006A C0          	RET  NZ                 ; ret if not equal
+0207   006B 7D          	LD   A,L
+0208   006C BB          	CP   E			; compare L E
+0209   006D C9          	RET                     ; return with status
+0210   006E             
+0211   006E             ;-------------------------------------------------------------------------------
+0212   006E             ; Monitor Entry point following an Error
+0213   006E             ;-------------------------------------------------------------------------------
+0214   006E E1          ERROR   POP  HL                 ; Discard return address 
+0215   006F 3E 3F       	LD   A,$3F              ; Get a "?"     
+0216   0071 CF          	RST  08H                ; And TX it out.
+0217   0072             
+0218   0072             ;-------------------------------------------------------------------------------
+0219   0072             ; Normal Monitor Entry Point
+0220   0072             ; Commands get here via RET or through 
+0221   0072             ; ERROR above
+0222   0072             ;-------------------------------------------------------------------------------
+0223   0072 CD 9A 02    ENTRY   CALL PR_CRLF            ; Print CRLF
+0224   0075 3E 3E       	LD   A,$3E              ; Get a ">"     
+0225   0077 CF          	RST  08H                ; and TX it out.
+0226   0078 21 72 00    	LD   HL,ENTRY           ; Set return address
+0227   007B E5          	PUSH HL                 ; on stack
+0228   007C CD 21 00    ENT01   CALL GETCHE             ; Get user char and echo to console      
+0229   007F FE 20       	CP   $20                ; skip spaces        
+0230   0081 28 F9       	JR   Z,ENT01            ; Go back for something else
+0231   0083 FE 55       	CP   $55                ; greater than last command? "T"     
+0232   0085 30 E7       	JR   NC,ERROR           ; give an error and start over
+0233   0087 D6 41       	SUB  $41                ; remove ascii
+0234   0089 38 E3       	JR   C,ERROR            ; less than first cmd "A" ?
+0235   008B             ;
+0236   008B             ;make offset into command table and execute
+0237   008B             ;
+0238   008B 87          	ADD  A,A                ; Make word offset
+0239   008C C6 96       	ADD  A,CMDTAB&0ffh      ; add to table base
+0240   008E 26 00       	LD   H,CMDTAB>>8        ; Set the upper address
+0241   0090 6F          	LD   L,A                ; Put offset in L
+0242   0091 5E          	LD   E,(HL)             ; load execution addr into DE
+0243   0092 23          	INC  HL                 ;
+0244   0093 56          	LD   D,(HL)             ;
+0245   0094 D5          	PUSH DE                 ; push exec addr
+0246   0095 C9          	RET                     ; And jump there now.
+0247   0096              
+0248   0096             ;-------------------------------------------------------------------------------
+0249   0096             ; Keyboard Command Vector Table
+0250   0096             ; Dont allow table to cross page boundry. Index into table doesn't "carry"
+0251   0096             ;-------------------------------------------------------------------------------
+0252   0096 00 00       CMDTAB  .WORD   COLDST         ; <A> $0000 RESET
+0253   0098 24 04       	.WORD   BOOT           ; <B> BOOT DISK
+0254   009A 61 02       	.WORD   COMPARE        ; <C> COMPARE MEMORY
+0255   009C BE 00       	.WORD   DUMPM          ; <D> DUMP MEMORY
+0256   009E 17 02       	.WORD   EDITR          ; <E> EXAMINE/MODIFY REGISTERS
+0257   00A0 52 02       	.WORD   FILL           ; <F> FILL MEMORY WITH VALUE
+0258   00A2 FC 00       	.WORD   GOCMD          ; <G> GO FROM LAST BREAKPOINT OR ADDR
+0259   00A4 4C 01       	.WORD   HEXDIF         ; <H> HEX SUM/DIFFERENCE
+0260   00A6 37 01       	.WORD   INPUT          ; <I> INPUT FROM PORT
+0261   00A8 50 00       	.WORD   MEMTST         ; <J> JUSTIFY MEMORY (MEMORY TEST)
+0262   00AA 25 01       	.WORD   BREAKP         ; <K> KILL/RESTORE LAST BREAKPOINT
+0263   00AC 3E 03       	.WORD   LOAD           ; <L> LOAD INTEL HEX PROGRAM
+0264   00AE 48 02       	.WORD   MOVE           ; <M> MOVE MEMORY
+0265   00B0 C4 03       	.WORD   SC_TEST        ; <N> SCSI TEST ROUTINE
+0266   00B2 44 01       	.WORD   OUTPUT         ; <O> OUTPUT TO PORT
+0267   00B4 60 01       	.WORD   PUTASC         ; <P> PUT ASCII IN MEMORY
+0268   00B6 2D 01       	.WORD   DSTACK         ; <Q> DISPLAY USER STACK LOCATION
+0269   00B8 85 01       	.WORD   REGCMD         ; <R> REGISTERS DISPLAY
+0270   00BA E0 00       	.WORD   SUBST          ; <S> SUBSTITUTE MEMORY
+0271   00BC 73 01       	.WORD   TYPE           ; <T> TYPE ASCII FROM MEMORY
+0272   00BE             
+0273   00BE             ;-------------------------------------------------------------------------------
+0274   00BE             ; Dump command DXXXX,YYYY
+0275   00BE             ;-------------------------------------------------------------------------------
+0276   00BE CD 01 03    DUMPM   CALL GET2ADR            ; Get 2 addresses
+0277   00C1 D8          	RET  C                  ; Exit if user Ctrl-C'd us.     
+0278   00C2 EB          	EX   DE,HL              ; Put start in HL, ending addr in DE    
+0279   00C3 CD 9A 02    DUMPM1  CALL PR_CRLF            ; TXCRLF        
+0280   00C6 CD 85 02    	CALL HLSLASH            ; Print addr in HL plus "/ "    
+0281   00C9 06 10       	LD   B,$10              ; Get 0-F bytes of data 
+0282   00CB C5          DUMPM2  PUSH BC                 ; Save the byte counter 
+0283   00CC 7E          	LD   A,(HL)             ; Load memory from HL   
+0284   00CD CD 77 02    	CALL PR2HEX             ; Convert byte to ASC in BC and TXA it  
+0285   00D0 CD 4C 00    	CALL PR_SPC             ; TXA a <space> 
+0286   00D3 C1          	POP  BC                 ; Get the byte counter back     
+0287   00D4 CD 68 00    	CALL CPHLDE             ; Check if HL=DE        
+0288   00D7 C8          	RET  Z                  ; Finished if at ending address 
+0289   00D8 23          	INC  HL                 ; Otherwise get next location   
+0290   00D9 05          	DEC  B                  ; Decrement byte count  
+0291   00DA 20 EF       	JR   NZ,DUMPM2          ; And finish this row.
+0292   00DC DF          	RST  18H                ; See if SIO has a character ready to read.
+0293   00DD C0          	RET  NZ                 ; Exit out if there's a character
+0294   00DE 18 E3       	JR   DUMPM1             ; else, get the next row.       
+0295   00E0             
+0296   00E0             ;-------------------------------------------------------------------------------
+0297   00E0             ; Substitute Memory command SXXXX
+0298   00E0             ;-------------------------------------------------------------------------------
+0299   00E0 CD D9 02    SUBST   CALL GET4H              ; Get 4 hex digits
+0300   00E3 D8          	RET  C                  ; Exit if he <Ctrl-C'd> us.     
+0301   00E4 CD 7C 02    SUBST1  CALL PRTMEM             ; Print CRLF + "/ " + byte at (HL)      
+0302   00E7 3E 2D       	LD   A,$2D              ; Character "-" 
+0303   00E9 CF          	RST  08H                ; TX it        
+0304   00EA EB          	EX   DE,HL              ; Swap
+0305   00EB CD C5 02    	CALL GET4HA             ; Get 4 Hex chars from User, convert in HL      
+0306   00EE EB          	EX   DE,HL              ; Place them in DE      
+0307   00EF 38 01       	JR   C,SUBST2           ; If user entry term'd normally, replace        
+0308   00F1 73          	LD   (HL),E             ; memory location with the new data in E        
+0309   00F2 23          SUBST2  INC  HL                 ; otherwise, skip ahead to the next location    
+0310   00F3 FE 20       	CP   $20                ; <spc>?        
+0311   00F5 28 ED       	JR   Z,SUBST1           ; Get next byte and location                    
+0312   00F7 FE 0A       	CP   $0A                ; LF?
+0313   00F9 28 E9       	JR   Z,SUBST1           ; Get next byte and location
+0314   00FB C9          	RET
+0315   00FC             
+0316   00FC             ;-------------------------------------------------------------------------------
+0317   00FC             ; GO command  GXXXX[,BBBB]
+0318   00FC             ;-------------------------------------------------------------------------------
+0319   00FC CD C5 02    GOCMD   CALL GET4HA             ; Get 4 hex digits
+0320   00FF 30 06       	JR   NC,GOCMD1          ; Must have given a good answer                 
+0321   0101 FE 03       	CP   $03                ; <CTRL-C>, must have chickened out
+0322   0103 C8          	RET  Z
+0323   0104 C3 24 00    	JP   EXIT               ; load stack frame and execute
+0324   0107             		
+0325   0107 EB          GOCMD1  EX   DE,HL              ; Put GOTO address in DE
+0326   0108 21 18 00    	LD   HL,$0018           ; offset to exec address on stack
+0327   010B 39          	ADD  HL,SP              ; make pointer
+0328   010C 2B          	DEC  HL                 
+0329   010D 72          	LD   (HL),D             ; Store User Jump Address
+0330   010E 2B          	DEC  HL                 ;
+0331   010F 73          	LD   (HL),E
+0332   0110 FE 2C               CP   $2C                ; Comma? User is Entering a Breakpoint also     
+0333   0112 C2 24 00    	JP   NZ,EXIT            ; End of Breakpoints? Pop everything and RET    
+0334   0115 CD D9 02    	CALL GET4H              ; Get XXXX from user for Breakpoint     
+0335   0118 D8          	RET  C                  ; Cancel if he <Ctrl-C>'s us    
+0336   0119 7E          	LD   A,(HL)             ; Save original memory contents
+0337   011A 32 22 FE    	LD   (BKDATA),A         ;
+0338   011D 22 20 FE    	LD   (BKPTR),HL         ; Save the address of the Breakpoint
+0339   0120 36 FF       	LD   (HL),$FF           ; Swap instruction at (HL) for a RST 38H.
+0340   0122 C3 24 00    	JP   EXIT               ; goto user addresss
+0341   0125             
+0342   0125             ;-------------------------------------------------------------------------------
+0343   0125             ; Kill / Remove Breakpoint K
+0344   0125             ;-------------------------------------------------------------------------------
+0345   0125 2A 20 FE    BREAKP  LD   HL,(BKPTR)         ; Get brk address
+0346   0128 3A 22 FE    	LD   A,(BKDATA)         ; Recall original contents      
+0347   012B 77          	LD   (HL),A             ; Write it back 
+0348   012C C9          	RET                     ; And finish.   
+0349   012D             
+0350   012D             ;-------------------------------------------------------------------------------
+0351   012D             ; Display User Stack Register Q
+0352   012D             ;-------------------------------------------------------------------------------
+0353   012D CD 4C 00    DSTACK  CALL PR_SPC             ; Print space
+0354   0130 21 18 00    	LD   HL,$0018           ; size of stack frame
+0355   0133 39          	ADD  HL,SP              ; point to stack frame
+0356   0134 C3 72 02    	JP   PRT_HL             ; Convert and TXA contents of HL        
+0357   0137             
+0358   0137             ;-------------------------------------------------------------------------------
+0359   0137             ; Input Port command INN           
+0360   0137             ;-------------------------------------------------------------------------------
+0361   0137 CD D9 02    INPUT   CALL GET4H              ; Get input address
+0362   013A D8          	RET  C                  ; Break?
+0363   013B CD 9A 02    	CALL PR_CRLF            ; TXCRLF        
+0364   013E 4D          	LD   C,L                ; Load the port address into C
+0365   013F ED 78       	IN   A,(C)              ; Get the data
+0366   0141 C3 77 02    	JP   PR2HEX             ; print ASCII and return
+0367   0144             
+0368   0144             ;-------------------------------------------------------------------------------
+0369   0144             ; Output Port command ONN,BB
+0370   0144             ;-------------------------------------------------------------------------------
+0371   0144 CD 01 03    OUTPUT  CALL GET2ADR            ; Get port,value
+0372   0147 D8          	RET  C                  ; Break?
+0373   0148 4B          	LD   C,E                ; Port address into C           
+0374   0149 ED 69       	OUT  (C),L              ; Output the yy data to the port address
+0375   014B C9          	RET                             
+0376   014C             
+0377   014C             ;-------------------------------------------------------------------------------
+0378   014C             ; Hex Sum/Difference command HXXXX,YYYY
+0379   014C             ;-------------------------------------------------------------------------------
+0380   014C CD 01 03    HEXDIF  CALL GET2ADR            ; Get 2 hex numbers
+0381   014F D8          	RET  C                  ; Break?
+0382   0150 CD 9A 02    	CALL PR_CRLF            ; TXCRLF        
+0383   0153 EB          	EX   DE,HL              ; Swap the values       
+0384   0154 19          	ADD  HL,DE              ; Do the addition               
+0385   0155 CD 85 02    	CALL HLSLASH            ; Convert and print the contents of HL
+0386   0158 97          	SUB  A                  ; Zero out A, clear CY (borrow flag)            
+0387   0159 ED 52       	SBC  HL,DE              ; Do the subtract               
+0388   015B ED 52       	SBC  HL,DE              ; Do it again to get the actual subtract
+0389   015D C3 72 02    	JP   PRT_HL             ; Convert and print contents of HL              
+0390   0160             
+0391   0160             ;-------------------------------------------------------------------------------
+0392   0160             ; Put ASCII string into memory PNNNN
+0393   0160             ;-------------------------------------------------------------------------------
+0394   0160 CD D9 02    PUTASC  CALL GET4H              ; Get address
+0395   0163 D8          	RET  C                  ; Break if <Ctrl-C>     
+0396   0164 CD 9A 02    	CALL PR_CRLF            ; TXCRLF        
+0397   0167 CD 21 00    PASC01  CALL GETCHE             ; RX a Character        
+0398   016A FE 03       	CP   $03                ; Break?        
+0399   016C CA 72 02    	JP   Z,PRT_HL           ; Convert and TXA contents of HL
+0400   016F 77          	LD   (HL),A             ; Store character into memory
+0401   0170 23          	INC  HL                 ; Next location
+0402   0171 18 F4       	JR   PASC01             ; Continue getting characters until user breaks out
+0403   0173              
+0404   0173             ;-------------------------------------------------------------------------------
+0405   0173             ; Type ASCII from memory command TXXXX,YYYY
+0406   0173             ;  This can screw up your terminal because it will print everything
+0407   0173             ;  including control codes
+0408   0173             ;-------------------------------------------------------------------------------
+0409   0173 CD 01 03    TYPE    CALL GET2ADR            ; Get start,end address
+0410   0176 D8          	RET  C			; Break?
+0411   0177 CD 9A 02    	CALL PR_CRLF            ; TXCRLF        
+0412   017A 1A          TYPE01  LD   A,(DE)             ; Load the Accum from location at DE
+0413   017B CF          	RST  08H                ; And TXA it.                           
+0414   017C CD 68 00    	CALL CPHLDE             ; Compare HL=DE, Z if =
+0415   017F C8          	RET  Z                  ; Exit when finished
+0416   0180 13          	INC  DE                 ; Get next memory location      
+0417   0181 DF          	RST  18H                ; Check SIO ready status        
+0418   0182 C0          	RET  NZ                 ; Exit if user has hit a key
+0419   0183 18 F5       	JR   TYPE01             ; Otherwise, continue on until finished 
+0420   0185             ;-------------------------------------------------------------------------------
+0421   0185             ; Register display command R<CR>|<`>
+0422   0185             ;-------------------------------------------------------------------------------
+0423   0185 CD 02 02    REGCMD  CALL REGPTR             ; Select register set
+0424   0188 CD 9A 02    REGC01  CALL PR_CRLF            ; TXCRLF
+0425   018B 1A          	LD   A,(DE)             ; Get beginning text into accumulator
+0426   018C FE FF       	CP   $FF                ; See if we're at the end of the text yet       
+0427   018E C8          	RET  Z                  ; Exit if we are        
+0428   018F CD EB 01    	CALL PRREG              ; Print register text 4 bytes at a time 
+0429   0192 18 F4       	JR   REGC01             ; Keep going until we are done. 
+0430   0194             
+0431   0194             ;------------------------------------------------------------------------------
+0432   0194             ; Characters for Register command to print
+0433   0194             ; 5 character fields.
+0434   0194             ; if last char=' ' register is 8bit X=16bit
+0435   0194             ; $FF is end of table
+0436   0194             ;------------------------------------------------------------------------------
+0437   0194 20 50 43 3D STRREG  .BYTE   " PC=X"
+0437   0198 58 
+0438   0199 20 20 41 3D 	.BYTE   "  A= "
+0438   019D 20 
+0439   019E 20 20 46 3D 	.BYTE   "  F= "
+0439   01A2 20 
+0440   01A3 20 20 42 3D 	.BYTE   "  B= "
+0440   01A7 20 
+0441   01A8 20 20 43 3D 	.BYTE   "  C= "
+0441   01AC 20 
+0442   01AD 20 20 44 3D 	.BYTE   "  D= "
+0442   01B1 20 
+0443   01B2 20 20 45 3D 	.BYTE   "  E= "
+0443   01B6 20 
+0444   01B7 20 48 4C 3D 	.BYTE   " HL=X"
+0444   01BB 58 
+0445   01BC 20 49 58 3D 	.BYTE   " IX=X"
+0445   01C0 58 
+0446   01C1 20 49 59 3D 	.BYTE   " IY=X"
+0446   01C5 58 
+0447   01C6 FF          	.BYTE   $FF             ; end marker
+0448   01C7             
+0449   01C7 20 41 60 3D STRALT  .BYTE   " A`= "
+0449   01CB 20 
+0450   01CC 20 46 60 3D 	.BYTE   " F`= "
+0450   01D0 20 
+0451   01D1 20 42 60 3D 	.BYTE   " B`= "
+0451   01D5 20 
+0452   01D6 20 43 60 3D 	.BYTE   " C`= "
+0452   01DA 20 
+0453   01DB 20 44 60 3D 	.BYTE   " D`= "
+0453   01DF 20 
+0454   01E0 20 45 60 3D 	.BYTE   " E`= "
+0454   01E4 20 
+0455   01E5 48 4C 60 3D 	.BYTE   "HL`=X"
+0455   01E9 58 
+0456   01EA FF          	.BYTE   $FF             ; end marker
+0457   01EB             
+0458   01EB             ;------------------------------------------------------------------------------
+0459   01EB             ; Print register name followed by 1 or 2 bytes
+0460   01EB             ; of register data
+0461   01EB             ;------------------------------------------------------------------------------         
+0462   01EB 0E 04       PRREG   LD   C,$04              ; length of name
+0463   01ED 1A          PRREG1  LD   A,(DE)             ; Load text at (DE)     
+0464   01EE 13          	INC  DE                 ; Get next location     
+0465   01EF CF          	RST  08H                ; Print current text byte       
+0466   01F0 0D          	DEC  C                  ; Decrement the counter 
+0467   01F1 20 FA       	JR   NZ,PRREG1          ; and Repeat until all 4 bytes are printed      
+0468   01F3 2B          	DEC  HL                 ; Decrement the register pointer  
+0469   01F4 7E          	LD   A,(HL)             ; Load it's contents in the accumulator 
+0470   01F5 CD 77 02    	CALL PR2HEX             ; Convert A to ascii in BC and print it
+0471   01F8 1A          	LD   A,(DE)             ; Get next text string of registers     
+0472   01F9 13          	INC  DE                 ; Update the location   
+0473   01FA FE 58       	CP   $58                ; An "X" indicates 2 byte value (HL,DE,IX,IY)
+0474   01FC C0          	RET  NZ                 ; Return if only 1 byte value needed    
+0475   01FD 2B          	DEC  HL                 ; Else get pointer to next byte 
+0476   01FE 7E          	LD   A,(HL)             ; Load it into A        
+0477   01FF C3 77 02    	JP   PR2HEX             ; Convert it to ASCII and print it.
+0478   0202             		
+0479   0202             ;------------------------------------------------------------------------------
+0480   0202             ; Select the prime or alt register set
+0481   0202             ;------------------------------------------------------------------------------         
+0482   0202 CD 21 00    REGPTR  CALL GETCHE             ; get argument <CR> or <'>
+0483   0205 21 1A 00    	LD   HL,$1A             ; reg offset on stack
+0484   0208 39          	ADD  HL,SP              ;
+0485   0209 11 94 01    	LD   DE,STRREG          ; text for Primary registers
+0486   020C FE 27       	CP   $27                ; Has user hit <'> for the Alternate Registers?
+0487   020E C0          	RET  NZ                 ; If not, we've got the right ones then
+0488   020F 21 0C 00    	LD   HL,$0C             ; Move pointer not quite so far for alternate registers
+0489   0212 39          	ADD  HL,SP              ; Stack plus the new start of registers
+0490   0213 11 C7 01    	LD   DE,STRALT          ; text for Alternate registers
+0491   0216 C9          	RET
+0492   0217             ;-------------------------------------------------------------------------------
+0493   0217             ; Edit registers
+0494   0217             ;-------------------------------------------------------------------------------
+0495   0217 CD 02 02    EDITR   CALL REGPTR             ; Set reg pointer
+0496   021A CD 9A 02    EDITR1  CALL PR_CRLF            ; TXCRLF
+0497   021D 1A          	LD   A,(DE)             ; Load variable space info (user registers)
+0498   021E FE FF       	CP   $FF                ; Reached the end of the text yet?
+0499   0220 C8          	RET  Z                  ; Quit when finished.
+0500   0221 CD EB 01    	CALL PRREG              ; Print register text 4 bytes at a time 
+0501   0224 CD 88 02    	CALL PSLASH             ; Print "/ " + contents of BC
+0502   0227 E5          	PUSH HL                 ; Store register value location
+0503   0228 CD C5 02    	CALL GET4HA             ; Get 4 characters into HL
+0504   022B E5          	PUSH HL                 ; and move it into
+0505   022C C1          	POP  BC                 ; B and C
+0506   022D E1          	POP  HL                 ; Get original register value location
+0507   022E F5          	PUSH AF                 ; Save last character user sent
+0508   022F 30 0A       	JR   NC,EDITR3          ; Store the new data there
+0509   0231             		
+0510   0231 F1          EDITR2  POP  AF                 ; Get the last user character back
+0511   0232 FE 20       	CP   $20                ; Was it a <space>?     
+0512   0234 28 E4       	JR   Z,EDITR1           ; Get set up to do the next registers                   
+0513   0236 FE 0A       	CP   $0A                ; <LF>?
+0514   0238 28 E0       	JR   Z,EDITR1           ; Space or LF continues on to edit other
+0515   023A C9          	RET                     ; registers, otherwise we are finished
+0516   023B             		
+0517   023B 71          EDITR3  LD   (HL),C             ; Store new register info to memory
+0518   023C 1B          	DEC  DE                 ; Where it will be picked up by a Go command
+0519   023D 1A          	LD   A,(DE)             ; Store it there
+0520   023E 13          	INC  DE                 ; Get next location if needed for 16 bit registers
+0521   023F FE 58       	CP   $58                ; Is it "X" ?   
+0522   0241 20 EE       	JR   NZ,EDITR2          ; Only 8 bits needed for basic reg (a,b,c,d,e)
+0523   0243 23          	INC  HL                 ; Must be 16 bit register set (HL,SP,IX,IY)
+0524   0244 70          	LD   (HL),B             ; so write that byte also
+0525   0245 2B          	DEC  HL                 ; Set up for the next location
+0526   0246 18 E9       	JR   EDITR2             ; And see what the user wants to do next
+0527   0248             
+0528   0248             ;-------------------------------------------------------------------------------
+0529   0248             ; Move command MXXXX,YYYY,ZZZZ
+0530   0248             ;-------------------------------------------------------------------------------        
+0531   0248 CD B7 02    MOVE    CALL GETARG             ; Get start,end,dest
+0532   024B D8          	RET  C                  ; Break?
+0533   024C DD E1       	POP  IX                 ; get return address (in case it gets clobbered)
+0534   024E ED B0       	LDIR                    ; Make the big move
+0535   0250 DD E9       	JP   (IX)               ; and go back to normal monitor entry point.
+0536   0252             
+0537   0252             ;-------------------------------------------------------------------------------
+0538   0252             ; Fill command FXXXX,YYYY,ZZ         
+0539   0252             ;-------------------------------------------------------------------------------
+0540   0252 CD B7 02    FILL    CALL GETARG             ; Get start,end,fill
+0541   0255 D8          	RET  C                  ; Break?
+0542   0256 DD E1       	POP  IX                 ; Get return addressy (in case it gets clobbered)
+0543   0258 73          FILL01  LD   (HL),E             ; Load new fill value into destination memory
+0544   0259 23          	INC  HL                 ; Increment to the next location
+0545   025A 0B          	DEC  BC                 ; Count down.
+0546   025B 78          	LD   A,B                ; Check BC to see if it's zero yet
+0547   025C B1          	OR   C          
+0548   025D 20 F9       	JR   NZ,FILL01          ; Check to see if we're finished, else loop back.
+0549   025F DD E9       	JP   (IX)               ; Jump back to monitor normal entry point.
+0550   0261             
+0551   0261             ;-------------------------------------------------------------------------------
+0552   0261             ; Compare command CXXXX,YYYY,ZZZZ
+0553   0261             ;-------------------------------------------------------------------------------        
+0554   0261 CD B7 02    COMPARE CALL GETARG             ; Get start,end,count
+0555   0264 D8          	RET  C                  ; May quit and go home early today
+0556   0265 1A          COMPR1  LD   A,(DE)             ; Get the byte from memory      
+0557   0266 BE          	CP   (HL)               ; Check it against the other location
+0558   0267 C2 7C 02    	JP   NZ,PRTMEM          ; Jump out if something's not right
+0559   026A 13          	INC  DE                 ; Otherwise proceed as normal, get next target
+0560   026B 23          	INC  HL                 ; and the next source
+0561   026C 0B          COMPR2  DEC  BC                 ; take one off the byte counter (BC)
+0562   026D 78          	LD   A,B                ; Check the byte counter to see where we are
+0563   026E B1          	OR   C                  ; See if we're done yet
+0564   026F 20 F4       	JR   NZ,COMPR1          ; Continue the compare until we get all the way done
+0565   0271 C9          	RET                     ; If we are, we can RETurn home
+0566   0272             
+0567   0272             ;-------------------------------------------------------------------------------
+0568   0272             ; HLOUT - Convert and transmit contents of HL register
+0569   0272             ;-------------------------------------------------------------------------------
+0570   0272 7C          PRT_HL  LD   A,H                ; Convert and TXA contents of H and L
+0571   0273 CD 77 02    	CALL PR2HEX             ; Convert H into ASCII BC and print it
+0572   0276 7D          	LD   A,L                ; Convert L
+0573   0277 CD 21 03    PR2HEX  CALL TO_HEX             ; Convert byte to ASCII
+0574   027A 18 21       	JR   OUT2CH             ; Send B and C to TXA and use that RETurn
+0575   027C             
+0576   027C             ;-------------------------------------------------------------------------------
+0577   027C             ; Print contents of HL registers, plus "/ ",
+0578   027C             ; and the contents of memory at location (HL)
+0579   027C             ;-------------------------------------------------------------------------------
+0580   027C CD 9A 02    PRTMEM  CALL PR_CRLF            ; TXCRLF
+0581   027F CD 85 02    	CALL HLSLASH            ; Print HL contents + "/ "
+0582   0282 7E          	LD   A,(HL)             ; Get Memory contents at (HL)
+0583   0283 18 F2       	JR   PR2HEX             ; Convert A to Ascii in BC and Print it 
+0584   0285             		
+0585   0285             ;-------------------------------------------------------------------------------
+0586   0285             ; Print HL then slash
+0587   0285             ;-------------------------------------------------------------------------------
+0588   0285 CD 72 02    HLSLASH CALL PRT_HL             ; Convert and Print Contents of HL
+0589   0288             
+0590   0288             ;-------------------------------------------------------------------------------
+0591   0288             ; Print "/ "
+0592   0288             ;-------------------------------------------------------------------------------
+0593   0288 01 20 2F    PSLASH  LD   BC,$2F20           ; Load "/ " in BC
+0594   028B 18 10       	JR   OUT2CH             ; and TX        it out.
+0595   028D             
+0596   028D             ;-------------------------------------------------------------------------------
+0597   028D             ; Print banner
+0598   028D             ;-------------------------------------------------------------------------------
+0599   028D 21 A2 02    SIGNON  LD   HL,BANNER          ; Print "SBC Monitor VX.X"
+0600   0290             
+0601   0290             ;-------------------------------------------------------------------------------
+0602   0290             ; Print CRLF then string pointed to by HL
+0603   0290             ;-------------------------------------------------------------------------------
+0604   0290 CD 9A 02    PRCRSTR CALL PR_CRLF            ; TXCRLF
+0605   0293             
+0606   0293             ;-------------------------------------------------------------------------------
+0607   0293             ; Print (HL) number of bytes, starting with ASCII characters from
+0608   0293             ; (HL+1) until end
+0609   0293             ;-------------------------------------------------------------------------------
+0610   0293 5E          OUTSTR  LD   E,(HL)             ; Get byte count
+0611   0294 23          OUTST1  INC  HL                 ; Move to start of text
+0612   0295 7E          	LD   A,(HL)             ; And get that character into A
+0613   0296 CF          	RST  08H                ; Print it
+0614   0297 1D          	DEC  E                  ; Decrement the character counter
+0615   0298 20 FA       	JR   NZ,OUTST1          ; Until all (E) characters are TXA'd
+0616   029A             
+0617   029A             ;-------------------------------------------------------------------------------
+0618   029A             ; Print CR LF
+0619   029A             ;-------------------------------------------------------------------------------
+0620   029A 01 0A 0D    PR_CRLF LD   BC,$0D0A           ; Get CR LF
+0621   029D             
+0622   029D             ;-------------------------------------------------------------------------------
+0623   029D             ; BCOUT - Ascii characters in BC are transmitted
+0624   029D             ;-------------------------------------------------------------------------------
+0625   029D 78          OUT2CH  LD   A,B                ; Get char from B
+0626   029E CF          	RST  08H                ; Print character from B
+0627   029F 79          	LD   A,C                ; Get character from C
+0628   02A0 CF          	RST  08H                ; Print character from C
+0629   02A1 C9          	RET
+0630   02A2             
+0631   02A2             ;-------------------------------------------------------------------------------
+0632   02A2 14 5A 38 30 BANNER  .BYTE   20,"Z80 SBC"
+0632   02A6 20 53 42 43 
+0633   02AA 20 4D 6F 6E 	.BYTE   " Monitor V0.1"
+0633   02AE 69 74 6F 72 
+0633   02B2 20 56 30 2E 
+0633   02B6 31 
+0634   02B7             	
+0635   02B7             ;-------------------------------------------------------------------------------
+0636   02B7             ; Get 3 comma sep arguments XXXX,YYYY,ZZZZ
+0637   02B7             ; XXXX in HL,YYYY in DE,ZZZZ in BC
+0638   02B7             ;-------------------------------------------------------------------------------
+0639   02B7 CD 01 03    GETARG  CALL GET2ADR            ; GET 2 addresses
+0640   02BA D8          	RET  C                  ; Break?
+0641   02BB ED 52       	SBC  HL,DE              ; Create a byte count for this op
+0642   02BD 23          	INC  HL                 ; Correct for the subtraction
+0643   02BE E5          	PUSH HL                 ; and save it temporarily
+0644   02BF CD D9 02    	CALL GET4H              ; GET zzzz From User (destination or value)
+0645   02C2 C1          	POP  BC                 ; Put byte counter in BC
+0646   02C3 EB          	EX   DE,HL              ; Flip so that Start=HL, End=DE
+0647   02C4 C9          	RET                     ; and Byte Count=BC
+0648   02C5             
+0649   02C5             ;-------------------------------------------------------------------------------
+0650   02C5             ; Gets four Hex characters from the console, convert them to value in HL
+0651   02C5             ;-------------------------------------------------------------------------------
+0652   02C5 21 00 00    GET4HA  LD   HL,$0000           ; Init return value
+0653   02C8 CD 21 00    	CALL GETCHE             ; Get and echo a Character
+0654   02CB FE 20       	CP   $20                ; Did he give us some <space>?
+0655   02CD 28 08       	JR   Z,GET4H1           ; Set the carry and quit
+0656   02CF FE 0A       	CP   $0A                ; Did he feed us a linefeed <LF>?
+0657   02D1 28 04       	JR   Z,GET4H1           ; Set the carry and quit
+0658   02D3 FE 0D       	CP   $0D                ; Is he trying to return his carriage <CR>?
+0659   02D5 20 14       	JR   NZ,GT4HX2          ; Hmm must be some other key            
+0660   02D7 37          GET4H1  SCF                     ; Set Carry Flag
+0661   02D8 C9          	RET                     ; and Return to main program            
+0662   02D9             
+0663   02D9             ;-------------------------------------------------------------------------------
+0664   02D9             ; This routine converts last four hex characters (0-9 A-F) user types
+0665   02D9             ; into a value in HL. Rotates the old out and replaces with the new until
+0666   02D9             ; the user hits a terminating character
+0667   02D9             ;-------------------------------------------------------------------------------
+0668   02D9 21 00 00    GET4H   LD   HL,$0000           ; Init return value
+0669   02DC CD 21 00    GT4HX1  CALL GETCHE             ; RX a character from the console
+0670   02DF FE 20       	CP   $20                ; space terminator?
+0671   02E1 C8          	RET  Z                  ; return
+0672   02E2 FE 0A       	CP   $0A                ; <LF> terminator?
+0673   02E4 C8          	RET  Z                  ; return
+0674   02E5 FE 0D       	CP   $0D                ; <CR>
+0675   02E7 C8          	RET  Z                  ; return
+0676   02E8 FE 2C       	CP   $2C                ; separator? <,> for multiple entries
+0677   02EA C8          	RET  Z                  ; return
+0678   02EB FE 03       GT4HX2  CP   $03                ; <ctrl-C> return with carry set
+0679   02ED 28 E8       	JR   Z,GET4H1           ; for testing later.
+0680   02EF 29          	ADD  HL,HL              ; shift result left 4 places
+0681   02F0 29          	ADD  HL,HL              ; by adding
+0682   02F1 29          	ADD  HL,HL              ;
+0683   02F2 29          	ADD  HL,HL              ;
+0684   02F3 D6 30       	SUB  $30                ; remove ASCII bias
+0685   02F5 FE 0A       	CP   $0A                ; Are we in the 0-9 range?
+0686   02F7 38 02       	JR   C,GT4HX3           ; Adjust for A-F
+0687   02F9 D6 07       	SUB  $07                ; correct for A-F
+0688   02FB E6 0F       GT4HX3  AND  $0F                ; strip off hi bits
+0689   02FD 85          	ADD  A,L                ; Add to result
+0690   02FE 6F          	LD   L,A                ; Move the byte back to L
+0691   02FF 18 DB       	JR   GT4HX1             ; and go back for next character
+0692   0301             
+0693   0301             ;-------------------------------------------------------------------------------        
+0694   0301             ; Get 2 comma separated hex values XXXX,YYYY
+0695   0301             ; XXXX in DE and YYYY in HL
+0696   0301             ;-------------------------------------------------------------------------------
+0697   0301 CD D9 02    GET2ADR CALL GET4H              ; Get the first four hex characters into HL
+0698   0304 D8          	RET  C                  ; But break out if he terminates
+0699   0305 EB          	EX   DE,HL              ; Put it in DE, go back again for yyyy
+0700   0306 18 D1       	JR   GET4H              ; and get four more chars to put in HL.         
+0701   0308             ;-------------------------------------------------------------------------------
+0702   0308             ; Convert HEX ASCII characters in B C registers to a byte value in A
+0703   0308             ;-------------------------------------------------------------------------------
+0704   0308 78          HEX2BIN LD   A,B                ; Move the hi order byte to A
+0705   0309 D6 30       	SUB  $30                ; Take it down from Ascii
+0706   030B FE 0A       	CP   $0A                ; Are we in the 0-9 range here?
+0707   030D 38 02       	JR   C,HX2B01           ; If so, get the next nybble
+0708   030F D6 07       	SUB  $07                ; But if A-F, take it down some more
+0709   0311 07          HX2B01  RLCA                    ; Rotate the nybble from low to high
+0710   0312 07          	RLCA                    ; One bit at a time
+0711   0313 07          	RLCA                    ; Until we
+0712   0314 07          	RLCA                    ; Get there with it
+0713   0315 47          	LD   B,A                ; Save the converted high nybble
+0714   0316 79          	LD   A,C                ; Now get the low order byte
+0715   0317 D6 30       	SUB  $30                ; Convert it down from Ascii
+0716   0319 FE 0A       	CP   $0A                ; 0-9 at this point?
+0717   031B 38 02       	JR   C,HX2B02           ; Good enough then, but
+0718   031D D6 07       	SUB  $07                ; Take off 7 more if it's A-F
+0719   031F 80          HX2B02  ADD  A,B                ; Add in the high order nybble
+0720   0320 C9          	RET
+0721   0321             ;-------------------------------------------------------------------------------
+0722   0321             ; Convert single byte in A to two Ascii characters in B and C
+0723   0321             ;-------------------------------------------------------------------------------
+0724   0321 47          TO_HEX  LD   B,A                ; Save the byte original value
+0725   0322 E6 0F       	AND  $0F                ; Strip off the high order nybble
+0726   0324 FE 0A       	CP   $0A                ; 0-9 at this point?
+0727   0326 38 02       	JR   C,TOHX01           ; We only need to add $30 then, or
+0728   0328 C6 07       	ADD  A,$07              ; Seven more if it's in the A-F range
+0729   032A C6 30       TOHX01  ADD  A,$30              ; Take the value on up to ASCII
+0730   032C 4F          	LD   C,A                ; Store the converted lo order character to C
+0731   032D 78          	LD   A,B                ; Get the original value back
+0732   032E 0F          	RRCA                    ; Rotate it to the right
+0733   032F 0F          	RRCA
+0734   0330 0F          	RRCA
+0735   0331 0F          	RRCA
+0736   0332 E6 0F       	AND  $0F                ; Mask off the upper trash
+0737   0334 FE 0A       	CP   $0A                ; 0-9 (< $0A)?
+0738   0336 38 02       	JR   C,TOHX02           ; Only add $30 then
+0739   0338 C6 07       	ADD  A,$07              ; And add it 7 if it's in the A-F range
+0740   033A C6 30       TOHX02  ADD  A,$30              ; Finish the conversion to ASCII
+0741   033C 47          	LD   B,A                ; Load the finished hi order character to B
+0742   033D C9          	RET                     ;
+0743   033E             
+0744   033E             ;------------------------------------------------------------------------------
+0745   033E             ; LOAD Intel Hex format file from the console.
+0746   033E             ; [Intel Hex Format is:
+0747   033E             ; 1) Colon (Frame 0)
+0748   033E             ; 2) Record Length Field (Frames 1 and 2)
+0749   033E             ; 3) Load Address Field (Frames 3,4,5,6)
+0750   033E             ; 4) Record Type Field (Frames 7 and 8)
+0751   033E             ; 5) Data Field (Frames 9 to 9+2*(Record Length)-1
+0752   033E             ; 6) Checksum Field - Sum of all byte values from Record Length to and 
+0753   033E             ;   including Checksum Field = 0 ]
+0754   033E             ;------------------------------------------------------------------------------        
+0755   033E CD 9A 02    LOAD    CALL PR_CRLF            ; TX CRLF
+0756   0341 CD 90 03    LOAD01  CALL GET_CH             ; Get character
+0757   0344 FE 03       	CP   $03                ; Break?
+0758   0346 C8          	RET  Z                  ; Return him to the prompt
+0759   0347 FE 3A       	CP   $3A                ; Colon <:>? Start of line of Intel Hex file
+0760   0349 20 30       	JR   NZ,LOAD04          ; If not, must be error, Tell him and quit
+0761   034B 1E 00       	LD   E,0                ; First two Characters is the Record Length Field
+0762   034D CD 99 03    	CALL GET2H              ; Get us two characters into BC, convert it to a byte <A>
+0763   0350 57          	LD   D,A                ; Load Record Length count into D
+0764   0351 CD 99 03    	CALL GET2H              ; Get next two characters, Memory Load Address <H>
+0765   0354 67          	LD   H,A                ; put value in H register.
+0766   0355 CD 99 03    	CALL GET2H              ; Get next two characters, Memory Load Address <L>
+0767   0358 6F          	LD   L,A                ; put value in L register.
+0768   0359 CD 99 03    	CALL GET2H              ; Get next two characters, Record Field Type
+0769   035C FE 01       	CP   $01                ; Record Field Type 00 is Data, 01 is End of File
+0770   035E 20 08       	JR   NZ,LOAD02          ; Must be the end of that file
+0771   0360 CD 99 03    	CALL GET2H              ; Get next two characters, assemble into byte
+0772   0363 7B          	LD   A,E                ; Recall the Checksum byte
+0773   0364 A7          	AND  A                  ; Is it Zero?
+0774   0365 C8          	RET  Z                  ; Must be o.k., go back for some more, else
+0775   0366 18 13       	JR   LOAD04             ; Checksums don't add up, Error out
+0776   0368             		
+0777   0368 7A          LOAD02  LD   A,D                ; Retrieve line character counter       
+0778   0369 A7          	AND  A                  ; Are we done with this line?
+0779   036A 28 08       	JR   Z,LOAD03           ; Get two more ascii characters, build a byte and checksum
+0780   036C             
+0781   036C CD 99 03    	CALL GET2H              ; Get next two chars, convert to byte in A, checksum it
+0782   036F 77          	LD   (HL),A             ; Checksum OK, move converted byte in A to memory location
+0783   0370 23          	INC  HL                 ; Increment pointer to next memory location     
+0784   0371 15          	DEC  D                  ; Decrement line character counter
+0785   0372 18 F4       	JR   LOAD02             ; and keep loading into memory until line is complete
+0786   0374             		
+0787   0374 CD 99 03    LOAD03  CALL GET2H              ; Get two chars, build byte and checksum
+0788   0377 7B          	LD   A,E                ; Check the checksum value
+0789   0378 A7          	AND  A                  ; Is it zero?
+0790   0379 28 C6       	JR   Z,LOAD01           ; If the checksum is still ok, continue on, else
+0791   037B 21 81 03    LOAD04  LD   HL,MS_CSE          ; Get "Checksum Error" message
+0792   037E C3 90 02    	JP   PRCRSTR            ; Print Message from (HL) and terminate the load
+0793   0381             		
+0794   0381 0E          MS_CSE  .BYTE   $0E             ; $0E characters to follow
+0795   0382 43 48 45 43 	.BYTE   "CHECKSUM ERROR"
+0795   0386 4B 53 55 4D 
+0795   038A 20 45 52 52 
+0795   038E 4F 52 
+0796   0390             
+0797   0390             ;-------------------------------------------------------------------------------
+0798   0390             ; Get a character from the console without echo
+0799   0390             ; must be $20-$7F to be valid (no control characters)
+0800   0390             ; <Ctrl-c> breaks with the Zero Flag set
+0801   0390             ;-------------------------------------------------------------------------------        
+0802   0390 D7          GET_CH  RST  10H                ; RX a Character
+0803   0391 FE 03       	CP   $03                ; <ctrl-c> User break?
+0804   0393 C8          	RET  Z                  
+0805   0394 FE 20       	CP   $20                ; <space> or better?
+0806   0396 38 F8       	JR   C,GET_CH            ; Do it again until we get something usable
+0807   0398 C9          	RET
+0808   0399             
+0809   0399             ;-------------------------------------------------------------------------------
+0810   0399             ; Gets two HEX ASCII characters from the console without echo and add to checksum
+0811   0399             ; Moves them into B and C, converts them into a byte value in A and updates a
+0812   0399             ; Checksum value in E
+0813   0399             ;-------------------------------------------------------------------------------
+0814   0399 CD 90 03    GET2H   CALL GET_CH             ; Get us a valid character to work with
+0815   039C 47          	LD   B,A                ; Load it in B
+0816   039D CD 90 03    	CALL GET_CH             ; Get us another character
+0817   03A0 4F          	LD   C,A                ; load it in C
+0818   03A1 CD 08 03    	CALL HEX2BIN            ; Convert ASCII to byte
+0819   03A4 4F          	LD   C,A                ; Build the checksum
+0820   03A5 7B          	LD   A,E
+0821   03A6 91          	SUB  C                  ; The checksum should always equal zero when checked
+0822   03A7 5F          	LD   E,A                ; Save the checksum back where it came from
+0823   03A8 79          	LD   A,C                ; Retrieve the byte and go back
+0824   03A9 C9          	RET
+0825   03AA             
+0826   03AA             ;-------------------------------------------------------------------------------
+0827   03AA             ; Default SCSI CDB for boot
+0828   03AA             ;-------------------------------------------------------------------------------
+0829   03AA             B_DATA:
+0830   03AA 08          	.BYTE $08	;read6 command
+0831   03AB             B_LUN:
+0832   03AB 00          	.BYTE 0		;LUN 0
+0833   03AC 00          	.BYTE 0
+0834   03AD 00          	.BYTE 0		;LBN 0
+0835   03AE 01          	.BYTE 1		;1 block
+0836   03AF 00          	.BYTE 0		;options=0
+0837   03B0             ;
+0838   03B0             ;spare CDB bytes
+0839   03B0 00          	.BYTE 0
+0840   03B1 00          	.BYTE 0
+0841   03B2 00          	.BYTE 0
+0842   03B3 00          	.BYTE 0
+0843   03B4 00          	.BYTE 0
+0844   03B5 00          	.BYTE 0
+0845   03B6             ;
+0846   03B6             ;------------------------------------------------------------------------------
+0847   03B6             ;default IO table
+0848   03B6             ;------------------------------------------------------------------------------
+0849   03B6             B_TID:
+0850   03B6 02          	.BYTE 2		;target ID
+0851   03B7 00          	.BYTE 0		;spare
+0852   03B8 00 FE       	.WORD SCCDB	;pointer to CDB
+0853   03BA 1E FE       	.WORD SCSTAT	;pointer to status
+0854   03BC 00 80       	.WORD SCBUFF	;pointer to data out
+0855   03BE 00 80       	.WORD SCBUFF	;pointer to data in
+0856   03C0 1C FE       	.WORD SCMSGO	;pointer to MSG out
+0857   03C2 1A FE       	.WORD SCMSGI	;pointer to MSG in
+0858   03C4             
+0859   03C4             ;------------------------------------------------------------------------------
+0860   03C4             ; SCSI TEST routine
+0861   03C4             ; I initialize SCSI pointers and CDB
+0862   03C4             ; R issue SCSI reset
+0863   03C4             ; C build SCSI command block
+0864   03C4             ; E execute SCSI command
+0865   03C4             ; D display buffer contents
+0866   03C4             ; X return to monitor
+0867   03C4             ;------------------------------------------------------------------------------
+0868   03C4             SC_TEST:
+0869   03C4 CD 9A 02    	CALL PR_CRLF		; issue CR LF
+0870   03C7 3E 3A       	LD   A,$3A              ; Prompt char ":"     
+0871   03C9 CF          	RST  08H                ; And TX it out.
+0872   03CA CD 21 00    	CALL GETCHE		; get command
+0873   03CD             ;
+0874   03CD             ;decode command
+0875   03CD             ;
+0876   03CD FE 49       	CP 'I'			; is it I
+0877   03CF 20 05        	JR NZ,NOT_I		;
+0878   03D1              
+0879   03D1             ;-------------------------------------------------------------------------------
+0880   03D1             ;intialize CDB AND IOT
+0881   03D1             ;
+0882   03D1 CD 18 04    	CALL S_ICDB		;init command block and IOT
+0883   03D4 18 EE       	JR SC_TEST
+0884   03D6             ;
+0885   03D6             NOT_I:
+0886   03D6 FE 52       	CP 'R'			; is it R
+0887   03D8 20 05       	JR NZ,NOT_R		;
+0888   03DA              
+0889   03DA             ;-------------------------------------------------------------------------------
+0890   03DA             ;reset SCSI bus
+0891   03DA             ;
+0892   03DA CD 3D 04    	CALL S_RESET		;
+0893   03DD 18 E5       	JR SC_TEST
+0894   03DF             ;
+0895   03DF             NOT_R:
+0896   03DF FE 43       	CP 'C'			; is it C
+0897   03E1 20 08       	JR NZ,NOT_C		;
+0898   03E3              
+0899   03E3             ;-------------------------------------------------------------------------------
+0900   03E3             ;enter (edit) CDB
+0901   03E3             ;
+0902   03E3 21 00 FE    	LD HL,SCCDB		; point to CDB
+0903   03E6 CD E4 00    	CALL SUBST1		; edit memory
+0904   03E9 18 D9       	JR SC_TEST		; get another command
+0905   03EB             ;
+0906   03EB             NOT_C:
+0907   03EB FE 45       	CP 'E'			; is it E
+0908   03ED 20 0F       	JR NZ,NOT_E		;
+0909   03EF              
+0910   03EF             ;-------------------------------------------------------------------------------
+0911   03EF             ; execute SCSI command
+0912   03EF             ;
+0913   03EF CD 4C 00    	CALL PR_SPC		; print space
+0914   03F2 DD 21 0C FE 	LD IX,SCIOT		; point to IO table 
+0915   03F6 CD 5B 04    	CALL S_GO		; execute SCSI command
+0916   03F9 CD 77 02    	CALL PR2HEX		; print return status
+0917   03FC 18 C6       	JR SC_TEST		; get another command
+0918   03FE             ;
+0919   03FE             NOT_E:
+0920   03FE FE 44       	CP 'D'			; is it D
+0921   0400 20 0B       	JR NZ,NOT_D		;
+0922   0402              
+0923   0402             ;-------------------------------------------------------------------------------
+0924   0402             ;dump buffer contents
+0925   0402             ;
+0926   0402 21 00 80    	LD HL,SCBUFF		; start address
+0927   0405 11 00 82    	LD DE,SCBUFF+512	; end address
+0928   0408 CD C3 00    	CALL DUMPM1		; dump buffer
+0929   040B 18 B7       	JR SC_TEST		; get another command
+0930   040D             ;
+0931   040D             NOT_D:
+0932   040D FE 58       	CP 'X'			; is it X
+0933   040F 20 01       	JR NZ,NOT_X		;
+0934   0411             ;
+0935   0411 C9          	RET			; exit
+0936   0412             ;-------------------------------------------------------------------------------
+0937   0412             ;not a valid command print "?" and go back
+0938   0412             ;
+0939   0412             NOT_X:
+0940   0412 3E 3F       	LD A,$3F		; question mark
+0941   0414 CF          	RST  08H                ; And TX it out.
+0942   0415 C3 C4 03    	JP SC_TEST
+0943   0418             
+0944   0418             ;-------------------------------------------------------------------------------
+0945   0418             ;init CDB and IOT
+0946   0418             ;-------------------------------------------------------------------------------
+0947   0418             S_ICDB:
+0948   0418 21 AA 03    	LD HL,B_DATA	;point to boot data
+0949   041B 11 00 FE    	LD DE,SCCDB	;dest in ram
+0950   041E 01 1A 00    	LD BC,26	;byte count
+0951   0421 ED B0       	LDIR		;block move
+0952   0423 C9          	RET
+0953   0424             
+0954   0424             ;-------------------------------------------------------------------------------
+0955   0424             ; Boot 
+0956   0424             ; Load drive 1 sector 0 into buffer and execute it
+0957   0424             ;-------------------------------------------------------------------------------
+0958   0424             BOOT:
+0959   0424 CD 18 04    	CALL S_ICDB	;init CDB and IOT
+0960   0427 06 02       	LD B,2		;retry count
+0961   0429             BOOT1:
+0962   0429 C5          	PUSH BC
+0963   042A             ;
+0964   042A             ;do scsi command
+0965   042A DD 21 0C FE 	LD IX,SCIOT	;point to io block
+0966   042E CD 5B 04    	CALL S_GO	;do SCSI io
+0967   0431             ;
+0968   0431 E6 1F       	AND $1F		;mask to error bits
+0969   0433 CA 00 80    	JP Z,SCBUFF	;good read exec loader
+0970   0436 C1          	POP BC		;recover retry count
+0971   0437 05          	DEC B		;dec retry
+0972   0438 20 EF       	JR NZ,BOOT1	;loop if more trys
+0973   043A C3 6E 00    	JP ERROR	;boot failed
+0974   043D             
+0975   043D             ;-------------------------------------------------------------------------------
+0976   043D             ;Generate SCSI bus reset
+0977   043D             ;-------------------------------------------------------------------------------
+0978   043D             S_RESET:
+0979   043D 3E 80       	LD A,$80
+0980   043F D3 89       	OUT (SR_ICR),A	;assert scsi reset
+0981   0441             S_RST1:
+0982   0441 00          	NOP
+0983   0442 00          	NOP
+0984   0443 3D          	DEC A
+0985   0444 20 FB       	JR NZ,S_RST1
+0986   0446 D3 89       	OUT (SR_ICR),A	;release scsi reset
+0987   0448             ;
+0988   0448 01 00 00    	LD BC,0
+0989   044B             S_DELY:
+0990   044B CD 56 04    	CALL S_KT	;kill time
+0991   044E 0B          	DEC BC
+0992   044F 78          	LD A,B
+0993   0450 B1          	OR C
+0994   0451 20 F8       	JR NZ,S_DELY	;loop till done
+0995   0453 DB 8F       	IN A,(SR_RPI)	;reset IRQ status
+0996   0455 C9          	RET
+0997   0456             
+0998   0456             S_KT:
+0999   0456 00          	NOP		;kill time
+1000   0457 00          	NOP
+1001   0458 00          	NOP
+1002   0459 00          	NOP
+1003   045A C9          	RET
+1004   045B             ;-------------------------------------------------------------------------------
+1005   045B             ;Do SCSI transaction
+1006   045B             ; IX=scsi IO block
+1007   045B             ;-------------------------------------------------------------------------------
+1008   045B             S_GO:
+1009   045B 3E FF       	LD A,$FF	;preset error status
+1010   045D DD 6E 04    	LD L,(IX+4)	;point to status address
+1011   0460 DD 66 05    	LD H,(IX+5)	;point to status address
+1012   0463 77          	LD (HL),A	;set error to timeout ($FF)
+1013   0464             ;
+1014   0464 AF          	XOR A		;
+1015   0465 D3 8A       	OUT (SR_MR),A	;reset control reg
+1016   0467 D3 8B       	OUT (SR_TCR),A	;clear command reg.
+1017   0469 D3 89       	OUT (SR_ICR),A	;
+1018   046B DD 7E 00    	LD A,(IX)	;get TID
+1019   046E D3 88       	OUT (SR_ODR),A	;set target ID
+1020   0470 3E 01       	LD A,$01	;drive bus
+1021   0472 D3 89       	OUT (SR_ICR),A	;
+1022   0474 3E 05       	LD A,$05	;set sel and drive bus
+1023   0476 D3 89       	OUT (SR_ICR),A	;
+1024   0478             ;
+1025   0478             ;wait for SCSI busy
+1026   0478 01 00 00    	LD BC,0		;init timeout
+1027   047B             S_SWT:
+1028   047B DB 8C       	IN A,(SR_CSBS)	;get bus status
+1029   047D E6 40       	AND SM_BSY	;mask to busy bit
+1030   047F 20 0A       	JR NZ,S_BSYA	;jmp if busy active
+1031   0481 0B          	DEC BC		;dec timeout
+1032   0482 78          	LD A,B		;test timeout=0
+1033   0483 B1          	OR C
+1034   0484 20 F5       	JR NZ,S_SWT	;jmp if no timeout
+1035   0486 AF          	XOR A		;clear A
+1036   0487 D3 89       	OUT (SR_ICR),A	;clear SEL and data
+1037   0489 18 0D       	JR S_EXIT	;error exit
+1038   048B             ;
+1039   048B             ;busy is active
+1040   048B             S_BSYA:
+1041   048B AF          	XOR A		;clear A
+1042   048C D3 89       	OUT (SR_ICR),A	;clear SEL and data
+1043   048E             
+1044   048E             ;-------------------------------------------------------------------------------
+1045   048E             ;Target is selected so test bsy and req
+1046   048E             ;then decode requested phase
+1047   048E             ;-------------------------------------------------------------------------------
+1048   048E             PHASE:
+1049   048E AF          	XOR A
+1050   048F D3 89       	OUT (SR_ICR),A	;reset initiator
+1051   0491             ;
+1052   0491             S_WTREQ:
+1053   0491 DB 8C       	IN A,(SR_CSBS)	;get bus status
+1054   0493 47          	LD B,A		;save copy
+1055   0494 E6 40       	AND SM_BSY	;mask to busy bit
+1056   0496 20 08       	JR NZ,S_WTRQ1	;still busy so cont.
+1057   0498             
+1058   0498             ;-------------------------------------------------------------------------------
+1059   0498             ;busy lost so exit
+1060   0498             ;-------------------------------------------------------------------------------
+1061   0498             S_EXIT:
+1062   0498 DD 6E 04    	LD L,(IX+4)	;get status pointer
+1063   049B DD 66 05    	LD H,(IX+5)	;get status pointer
+1064   049E 7E          	LD A,(HL)	;get final status
+1065   049F C9          	RET		;busy lost? were done
+1066   04A0             ;
+1067   04A0             S_WTRQ1:
+1068   04A0 78          	LD A,B		;recover status
+1069   04A1 E6 20       	AND SM_REQ	;request active?
+1070   04A3 28 EC       	JR Z,S_WTREQ	;loop till request
+1071   04A5             
+1072   04A5             ;-------------------------------------------------------------------------------
+1073   04A5             ;request is active so set 5380 to requested phase
+1074   04A5             ;-------------------------------------------------------------------------------
+1075   04A5 78          	LD A,B		;recover bus status
+1076   04A6 CB 1F       	RR A
+1077   04A8 CB 1F       	RR A
+1078   04AA E6 07       	AND $07		;mask to phase bits
+1079   04AC D3 8B       	OUT (SR_TCR),A	;set phase
+1080   04AE             ;
+1081   04AE             ;jump to phase handler
+1082   04AE             ;
+1083   04AE 78          	LD A,B		;recover bus status 
+1084   04AF CB 1F       	RR A
+1085   04B1 E6 0E       	AND $0E		;mask to phase bits
+1086   04B3 5F          	LD E,A
+1087   04B4 16 00       	LD D,0
+1088   04B6 21 BF 04    	LD HL,PHTABL	;point to table
+1089   04B9 19          	ADD HL,DE	;offset into table
+1090   04BA 5E          	LD E,(HL)
+1091   04BB 23          	INC HL
+1092   04BC 56          	LD D,(HL)
+1093   04BD D5          	PUSH DE
+1094   04BE C9          	RET		;execute phase
+1095   04BF             
+1096   04BF             ;-------------------------------------------------------------------------------
+1097   04BF             ;phase table
+1098   04BF             ;-------------------------------------------------------------------------------
+1099   04BF             PHTABL:
+1100   04BF CF 04       	.WORD	PHASE0	;data out
+1101   04C1 D8 04       	.WORD	PHASE1	;data in
+1102   04C3 E1 04       	.WORD	PHASE2	;cmd out
+1103   04C5 EA 04       	.WORD	PHASE3	;status in
+1104   04C7 98 04       	.WORD	S_EXIT	;unused
+1105   04C9 98 04       	.WORD	S_EXIT	;unused
+1106   04CB F3 04       	.WORD	PHASE6	;message out
+1107   04CD FC 04       	.WORD	PHASE7	;message in
+1108   04CF             
+1109   04CF             ;-------------------------------------------------------------------------------
+1110   04CF             ;phase handlers
+1111   04CF             ;-------------------------------------------------------------------------------
+1112   04CF             ;
+1113   04CF             ;DATA OUT
+1114   04CF             PHASE0:
+1115   04CF DD 6E 06    	LD L,(IX+6)
+1116   04D2 DD 66 07    	LD H,(IX+7)
+1117   04D5 C3 05 05    	JP S_WRIT
+1118   04D8             ;
+1119   04D8             ;DATA IN
+1120   04D8             PHASE1:
+1121   04D8 DD 6E 08    	LD L,(IX+8)
+1122   04DB DD 66 09    	LD H,(IX+9)
+1123   04DE C3 35 05    	JP S_READ
+1124   04E1             ;
+1125   04E1             ;CMD OUT
+1126   04E1             PHASE2:
+1127   04E1 DD 6E 02    	LD L,(IX+2)
+1128   04E4 DD 66 03    	LD H,(IX+3)
+1129   04E7 C3 05 05    	JP S_WRIT
+1130   04EA             ;
+1131   04EA             ;STATUS IN
+1132   04EA             PHASE3:
+1133   04EA DD 6E 04    	LD L,(IX+4)
+1134   04ED DD 66 05    	LD H,(IX+5)
+1135   04F0 C3 35 05    	JP S_READ
+1136   04F3             ;
+1137   04F3             ;MSG OUT
+1138   04F3             PHASE6:
+1139   04F3 DD 6E 0A    	LD L,(IX+10)
+1140   04F6 DD 66 0B    	LD H,(IX+11)
+1141   04F9 C3 05 05    	JP S_WRIT
+1142   04FC             ;
+1143   04FC             ;MSG IN
+1144   04FC             PHASE7:
+1145   04FC DD 6E 0C    	LD L,(IX+12)
+1146   04FF DD 66 0D    	LD H,(IX+13)
+1147   0502 C3 35 05    	JP S_READ
+1148   0505             
+1149   0505             ;-------------------------------------------------------------------------------
+1150   0505             ;SCSI write routine (send bytes to target)
+1151   0505             ;-------------------------------------------------------------------------------
+1152   0505             S_WRIT:
+1153   0505 3E 01       	LD A,1		;drive SCSI data bus
+1154   0507 D3 89       	OUT (SR_ICR),A
+1155   0509             ;
+1156   0509             ;wait for req while checking busy
+1157   0509             ;
+1158   0509             S_WWREQ:
+1159   0509 DB 8C       	IN A,(SR_CSBS)	;get current bus stat
+1160   050B 47          	LD B,A		;save it
+1161   050C E6 20       	AND SM_REQ	;request active?
+1162   050E 20 09       	JR NZ,S_WNXT	;
+1163   0510             ;
+1164   0510 78          	LD A,B		;recover current bus stat
+1165   0511 E6 40       	AND SM_BSY	;still busy?
+1166   0513 C2 09 05    	JP NZ,S_WWREQ	;loop if stil busy
+1167   0516 C3 8E 04    	JP PHASE	;
+1168   0519             ;
+1169   0519             ;request active so check phase
+1170   0519             ;
+1171   0519             S_WNXT:
+1172   0519 DB 8D       	IN A,(SR_BSR)	;get status
+1173   051B E6 08       	AND SM_PHM	;mask to phase match
+1174   051D CA 8E 04    	JP Z,PHASE	;jmp if phase mismatch
+1175   0520             ;
+1176   0520             ;request active and phase match so send data
+1177   0520             ;
+1178   0520 7E          	LD A,(HL)	;get byte
+1179   0521 D3 88       	OUT (SR_ODR),A	;send data
+1180   0523 3E 11       	LD A,$11	;ack and data
+1181   0525 D3 89       	OUT (SR_ICR),A	;set ack,drive scsi bus
+1182   0527 23          	INC HL
+1183   0528             ;
+1184   0528             ;wait for request to drop
+1185   0528             ;
+1186   0528             S_WNREQ:
+1187   0528 DB 8C       	IN A,(SR_CSBS)	;get current status
+1188   052A E6 20       	AND SM_REQ
+1189   052C 20 FA       	JR NZ,S_WNREQ	;loop till req drops
+1190   052E             ;
+1191   052E 3E 01       	LD A,$1		;drop ack,assert data
+1192   0530 D3 89       	OUT (SR_ICR),A	;drop ACK
+1193   0532 C3 09 05    	JP S_WWREQ	;loop for next byte/phase
+1194   0535             
+1195   0535             ;-------------------------------------------------------------------------------
+1196   0535             ;SCSI read routine (get bytes from target)
+1197   0535             ;-------------------------------------------------------------------------------
+1198   0535             ;
+1199   0535             S_READ:
+1200   0535             ;
+1201   0535             ;wait for req while checking busy
+1202   0535             ;
+1203   0535             S_RWREQ:
+1204   0535 DB 8C       	IN A,(SR_CSBS)	;get current bus stat
+1205   0537 47          	LD B,A		;save it
+1206   0538 E6 20       	AND SM_REQ	;request active?
+1207   053A 20 09       	JR NZ,S_RNXT	;
+1208   053C             ;
+1209   053C 78          	LD A,B		;recover current bus stat
+1210   053D E6 40       	AND SM_BSY	;still busy?
+1211   053F C2 35 05    	JP NZ,S_RWREQ	;loop if stil busy
+1212   0542 C3 8E 04    	JP PHASE	;
+1213   0545             ;
+1214   0545             ;request active so check phase
+1215   0545             S_RNXT:
+1216   0545 DB 8D       	IN A,(SR_BSR)	;get status
+1217   0547 E6 08       	AND SM_PHM	;mask to phase match
+1218   0549 CA 8E 04    	JP Z,PHASE	;jmp if phase mismatch
+1219   054C             ;
+1220   054C             ;request active and phase match so get data
+1221   054C             ;
+1222   054C DB 88       	IN A, (SR_CSD)	;get current SCSI data
+1223   054E 77          	LD (HL),A	;save data
+1224   054F 3E 10       	LD A,$10
+1225   0551 D3 89       	OUT (SR_ICR),A	;set ack
+1226   0553 23          	INC HL		;advance buf pointer
+1227   0554             ;
+1228   0554             ;wait for request to drop
+1229   0554             ;
+1230   0554             S_RNREQ:
+1231   0554 DB 8C       	IN A,(SR_CSBS)	;get current status
+1232   0556 E6 20       	AND SM_REQ
+1233   0558 20 FA       	JR NZ,S_RNREQ	;loop till req drops
+1234   055A AF          	XOR A
+1235   055B D3 89       	OUT (SR_ICR),A	;drop ACK
+1236   055D C3 35 05    	JP S_READ	;loop for next byte/phase
+1237   0560             
+1238   0560             ;-------------------------------------------------------------------------------
+1239   0560             ; INITIALIZE HARDWARE
+1240   0560             ;-------------------------------------------------------------------------------
+1241   0560             HINIT:
+1242   0560             ;
+1243   0560 ED 56       	IM 1		;set irq mode
+1244   0562             ;
+1245   0562             ; initialize ns16550
+1246   0562             ;
+1247   0562 3E 87       	LD  A,87H       ;SET WL,STOP,DLAB
+1248   0564 D3 83       	OUT (UART+3),A  ;
+1249   0566 3E 00       	LD  A,00H       ;SET DIVISOR LOW
+1250   0568 D3 81       	OUT (UART+1),A  ;
+1251   056A 3E 0C       	LD  A,0CH       ;SET DIVISOR HI
+1252   056C D3 80       	OUT (UART),A    ;
+1253   056E 3E 07       	LD  A,07H       ;CLEAR DLAB BIT
+1254   0570 D3 83       	OUT (UART+3),A  ;
+1255   0572 3E 00       	LD  A,00H       ;CLEAR IEN
+1256   0574 D3 81       	OUT (UART+1),A  ;
+1257   0576 D3 84       	OUT (UART+4),A  ;
+1258   0578             ;
+1259   0578             ;Initialize SCSI NCR 5380 chip
+1260   0578             ;
+1261   0578 AF          	XOR A		;clear a
+1262   0579 D3 89       	OUT (SR_ICR),A
+1263   057B D3 8A       	OUT (SR_MR),A
+1264   057D D3 8B       	OUT (SR_TCR),A
+1265   057F D3 8C       	OUT (SR_SER),A
+1266   0581 CD 3D 04    	CALL S_RESET	;reset SCSI bus
+1267   0584 C9          	RET
+1268   0585             
+1269   0585             ;-------------------------------------------------------------------------------
+1270   0585             FINIS       .END
+tasm: Number of errors = 0

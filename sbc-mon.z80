@@ -1,0 +1,1270 @@
+;==============================================================================
+; Z80 CPU Monitor Rom 
+; NCR5380 SCSI NS16550 serial
+; This doesn't use any features of the 16550
+; So a 8250 should work ok
+;
+; J.C.LANG 12/15/2017
+; 07/04/2020 changed equates for z80-sbc
+;==============================================================================
+ROM	.equ	$0
+RAM	.equ	$FE00
+;------------------------------------------------------------------------------
+;IO port addresses
+;------------------------------------------------------------------------------
+UART    .equ    $80
+SCSI    .equ    $88
+;
+;NCR 5380 I/O REGISTERS
+SR_CSD	.EQU	SCSI
+SR_ICR	.EQU	SCSI+$01
+SR_MR	.EQU	SCSI+$02
+SR_TCR	.EQU	SCSI+$03
+SR_CSBS	.EQU	SCSI+$04
+SR_BSR	.EQU	SCSI+$05
+SR_IDR	.EQU	SCSI+$06
+SR_RPI	.EQU	SCSI+$07
+;
+;NCR 5380 OUTPUT ONLY REGISTERS
+SR_ODR	.EQU	SCSI
+SR_SER	.EQU	SCSI+$04
+SR_SDS	.EQU	SCSI+$05
+SR_SDTR	.EQU	SCSI+$06
+SR_SDIR	.EQU	SCSI+$07
+;
+;CURRENT BUS STATUS BIT MASKS
+SM_RST	.EQU	$80	;reset
+SM_BSY	.EQU	$40	;busy
+SM_REQ	.EQU	$20	;request
+SM_MSG	.EQU	$10	;message
+SM_CD	.EQU	$08	;cmd/data
+SM_IO	.EQU	$04	;in/out
+SM_SEL	.EQU	$02	;select
+SM_DBP	.EQU	$01	;
+;
+SM_PHM	.EQU	$08	;phase match bit
+;
+;------------------------------------------------------------------------------
+;MONITOR RAM LOCATIONS
+;------------------------------------------------------------------------------
+	.ORG	$8000
+;
+;2nd. stage boot loader location
+;default SCSI data buffer for test routines
+SCBUFF	.DS 512	;
+;
+	.ORG	RAM	;start of RAM
+STACK	.equ RAM-1	;top of stack location
+;
+SCCDB	.DS 12	;SCSI command block
+;
+;SCSI IO pointer table
+SCIOT	.DS 1	;SCSI target ID
+	.DS 1	;spare (future LUN?)
+	.DS 2	;CDB pointer
+	.DS 2	;STATUS pointer
+	.DS 2	;DATA OUT pointer
+	.DS 2	;DATA IN pointer
+	.DS 2	;MSG OUT pointer
+	.DS 2	;MSG IN pointer
+;
+SCMSGI	.DS 2	;SCSI message in buffer
+SCMSGO	.DS 2	;SCSI message out buffer
+SCSTAT	.DS 2	;SCSI ending status buffer
+BKPTR	.DS 2	;save breakpoint address
+BKDATA	.DS 1	;save old breakpoint data
+
+
+	.ORG ROM
+;------------------------------------------------------------------------------
+; Cold bootup sequence
+;------------------------------------------------------------------------------
+COLDST  LD   SP,STACK           ; SP near top of SRam   
+	CALL HINIT              ; Initialize hardware   
+	RST  38H                ; Push all registers on stack, prompt   
+;
+	.DB	$FF             ; filler
+
+;------------------------------------------------------------------------------
+; RST 08 - Transmit a character in A
+;------------------------------------------------------------------------------
+TX_CH   PUSH AF                 ; TX Char in A to RS232 
+TX_CLOP RST  18H                ; Ck status of SIO      
+	JR   NC,TX_CLOP         ; Ck Carry flag until TX buffer is clear
+	POP  AF                 ; Get original Character back   
+	OUT  (UART),A           ; And out it to the SIO
+	RET
+
+;-------------------------------------------------------------------------------
+; RST 10 - Read a character into A
+;-------------------------------------------------------------------------------
+RX_CH   RST  18H                ; RX Char from RS232 to A       
+	JR   Z,RX_CH            ; Ck Zero Flag and loop until Char is in        
+	IN   A,(UART)           ; Get Character into A
+	AND  $7F                ; Strip off the top bit D7 (0111 1111)
+	RET
+
+;-------------------------------------------------------------------------------
+; RST 18 - Check SIO status
+;-------------------------------------------------------------------------------
+UARTST  IN   A,(UART+5)         ; Status byte D0=TX Empty, D1=RX ready 
+	RLCA                    ; Rotates TX status into Carry Flag,    
+	RLCA                    ; Rotates TX status into Carry Flag,    
+	RLCA                    ; Rotates TX status into Carry Flag,    
+	BIT  3,A                ; Set Zero flag if RXdata not available 
+	RET 
+
+;-------------------------------------------------------------------------------
+; RST 20        - does not function as a restart
+;-------------------------------------------------------------------------------
+	RET
+
+;-------------------------------------------------------------------------------
+; Get character and echo to console
+;-------------------------------------------------------------------------------
+GETCHE  RST  10H                ; Loops a character in, RX Char 
+	JR   TX_CH              ; echo character
+
+;-------------------------------------------------------------------------------
+; Pop all registers from stack and return to user code		
+;-------------------------------------------------------------------------------
+EXIT    POP  HL			; discard return address
+	POP  HL			; pop all registers
+	POP  DE
+	POP  BC
+	POP  AF
+	EX   AF,AF'
+	EXX
+	POP  IY
+	POP  IX
+	POP  HL
+	POP  DE
+	POP  BC
+	POP  AF
+	EI                      ; Enable INT
+	RET                     ; return to user routine
+				; address on stack set by "GO"
+
+	.org ROM+$38
+;-------------------------------------------------------------------------------
+; RST 38 - INTERRUPT VECTOR [ for IM 1 ]
+; Push all registers on stack and goto command loop
+;-------------------------------------------------------------------------------
+RST38   DI                      ; Breakpoint, Disable Interrupts        
+	PUSH AF                 ; And Push all registers on Stack       
+	PUSH BC
+	PUSH DE                         
+	PUSH HL                         
+	PUSH IX                         
+	PUSH IY                         
+	EXX                     ; Push the alternate registers also
+	EX   AF,AF'                     
+	PUSH AF                         
+	PUSH BC                         
+	PUSH DE                         
+	PUSH HL
+	CALL SIGNON             ; Print "SBC Monitor VX.X"      
+	JR   ENTRY              ; and Enter the Monitor at Prompt       
+
+;-------------------------------------------------------------------------------
+; Print a space on console
+;-------------------------------------------------------------------------------
+PR_SPC  LD   A,$20              ; TX a <spc> out the RS232      
+	JR   TX_CH
+
+;-------------------------------------------------------------------------------
+; Memory Test JXXXX,YYYY
+;-------------------------------------------------------------------------------
+MEMTST  CALL GET2ADR            ; Get XXXX to DE,YYYY to HL from user   
+	RET  C                  ; on Carry <Ctrl-C> was hit, cancel.    
+	EX   DE,HL              ; Swap start, ending address
+MEMT01  LD   A,(HL)             ; Get byte from starting address        
+	LD   B,A                ; Save it       
+	CPL                     ; Invert all 1's, 0's   
+	LD   (HL),A             ; Write it back 
+	XOR  (HL)               ; Get logical difference        
+	JP   NZ,PRTMEM          ; Write it out if there's a problem     
+	LD   (HL),B             ; else, restore the original byte       
+	CALL CPHLDE             ; Check if HL=DE, Zero if =     
+	INC  HL                 ; Next location 
+	JR   NZ,MEMT01          ; HL<>DE, repeat the process    
+	RET                     ; and get back to the prompt   
+ 
+	.org ROM+$66
+;-------------------------------------------------------------------------------
+; [NMI VECTOR]
+; The NMI signal can cause a program to break and save all its register values
+; The INT signal would work the same if the processor is put into IM 1
+;-------------------------------------------------------------------------------
+RST66   JR   RST38              ; Just play like it's an INT in IM 1
+
+;-------------------------------------------------------------------------------
+; CPHLDE Compare HL and DE
+;-------------------------------------------------------------------------------
+CPHLDE  LD   A,H                ;
+	CP   D			; compare H D
+	RET  NZ                 ; ret if not equal
+	LD   A,L
+	CP   E			; compare L E
+	RET                     ; return with status
+
+;-------------------------------------------------------------------------------
+; Monitor Entry point following an Error
+;-------------------------------------------------------------------------------
+ERROR   POP  HL                 ; Discard return address 
+	LD   A,$3F              ; Get a "?"     
+	RST  08H                ; And TX it out.
+
+;-------------------------------------------------------------------------------
+; Normal Monitor Entry Point
+; Commands get here via RET or through 
+; ERROR above
+;-------------------------------------------------------------------------------
+ENTRY   CALL PR_CRLF            ; Print CRLF
+	LD   A,$3E              ; Get a ">"     
+	RST  08H                ; and TX it out.
+	LD   HL,ENTRY           ; Set return address
+	PUSH HL                 ; on stack
+ENT01   CALL GETCHE             ; Get user char and echo to console      
+	CP   $20                ; skip spaces        
+	JR   Z,ENT01            ; Go back for something else
+	CP   $55                ; greater than last command? "T"     
+	JR   NC,ERROR           ; give an error and start over
+	SUB  $41                ; remove ascii
+	JR   C,ERROR            ; less than first cmd "A" ?
+;
+;make offset into command table and execute
+;
+	ADD  A,A                ; Make word offset
+	ADD  A,CMDTAB&0ffh      ; add to table base
+	LD   H,CMDTAB>>8        ; Set the upper address
+	LD   L,A                ; Put offset in L
+	LD   E,(HL)             ; load execution addr into DE
+	INC  HL                 ;
+	LD   D,(HL)             ;
+	PUSH DE                 ; push exec addr
+	RET                     ; And jump there now.
+ 
+;-------------------------------------------------------------------------------
+; Keyboard Command Vector Table
+; Dont allow table to cross page boundry. Index into table doesn't "carry"
+;-------------------------------------------------------------------------------
+CMDTAB  .WORD   COLDST         ; <A> $0000 RESET
+	.WORD   BOOT           ; <B> BOOT DISK
+	.WORD   COMPARE        ; <C> COMPARE MEMORY
+	.WORD   DUMPM          ; <D> DUMP MEMORY
+	.WORD   EDITR          ; <E> EXAMINE/MODIFY REGISTERS
+	.WORD   FILL           ; <F> FILL MEMORY WITH VALUE
+	.WORD   GOCMD          ; <G> GO FROM LAST BREAKPOINT OR ADDR
+	.WORD   HEXDIF         ; <H> HEX SUM/DIFFERENCE
+	.WORD   INPUT          ; <I> INPUT FROM PORT
+	.WORD   MEMTST         ; <J> JUSTIFY MEMORY (MEMORY TEST)
+	.WORD   BREAKP         ; <K> KILL/RESTORE LAST BREAKPOINT
+	.WORD   LOAD           ; <L> LOAD INTEL HEX PROGRAM
+	.WORD   MOVE           ; <M> MOVE MEMORY
+	.WORD   SC_TEST        ; <N> SCSI TEST ROUTINE
+	.WORD   OUTPUT         ; <O> OUTPUT TO PORT
+	.WORD   PUTASC         ; <P> PUT ASCII IN MEMORY
+	.WORD   DSTACK         ; <Q> DISPLAY USER STACK LOCATION
+	.WORD   REGCMD         ; <R> REGISTERS DISPLAY
+	.WORD   SUBST          ; <S> SUBSTITUTE MEMORY
+	.WORD   TYPE           ; <T> TYPE ASCII FROM MEMORY
+
+;-------------------------------------------------------------------------------
+; Dump command DXXXX,YYYY
+;-------------------------------------------------------------------------------
+DUMPM   CALL GET2ADR            ; Get 2 addresses
+	RET  C                  ; Exit if user Ctrl-C'd us.     
+	EX   DE,HL              ; Put start in HL, ending addr in DE    
+DUMPM1  CALL PR_CRLF            ; TXCRLF        
+	CALL HLSLASH            ; Print addr in HL plus "/ "    
+	LD   B,$10              ; Get 0-F bytes of data 
+DUMPM2  PUSH BC                 ; Save the byte counter 
+	LD   A,(HL)             ; Load memory from HL   
+	CALL PR2HEX             ; Convert byte to ASC in BC and TXA it  
+	CALL PR_SPC             ; TXA a <space> 
+	POP  BC                 ; Get the byte counter back     
+	CALL CPHLDE             ; Check if HL=DE        
+	RET  Z                  ; Finished if at ending address 
+	INC  HL                 ; Otherwise get next location   
+	DEC  B                  ; Decrement byte count  
+	JR   NZ,DUMPM2          ; And finish this row.
+	RST  18H                ; See if SIO has a character ready to read.
+	RET  NZ                 ; Exit out if there's a character
+	JR   DUMPM1             ; else, get the next row.       
+
+;-------------------------------------------------------------------------------
+; Substitute Memory command SXXXX
+;-------------------------------------------------------------------------------
+SUBST   CALL GET4H              ; Get 4 hex digits
+	RET  C                  ; Exit if he <Ctrl-C'd> us.     
+SUBST1  CALL PRTMEM             ; Print CRLF + "/ " + byte at (HL)      
+	LD   A,$2D              ; Character "-" 
+	RST  08H                ; TX it        
+	EX   DE,HL              ; Swap
+	CALL GET4HA             ; Get 4 Hex chars from User, convert in HL      
+	EX   DE,HL              ; Place them in DE      
+	JR   C,SUBST2           ; If user entry term'd normally, replace        
+	LD   (HL),E             ; memory location with the new data in E        
+SUBST2  INC  HL                 ; otherwise, skip ahead to the next location    
+	CP   $20                ; <spc>?        
+	JR   Z,SUBST1           ; Get next byte and location                    
+	CP   $0A                ; LF?
+	JR   Z,SUBST1           ; Get next byte and location
+	RET
+
+;-------------------------------------------------------------------------------
+; GO command  GXXXX[,BBBB]
+;-------------------------------------------------------------------------------
+GOCMD   CALL GET4HA             ; Get 4 hex digits
+	JR   NC,GOCMD1          ; Must have given a good answer                 
+	CP   $03                ; <CTRL-C>, must have chickened out
+	RET  Z
+	JP   EXIT               ; load stack frame and execute
+		
+GOCMD1  EX   DE,HL              ; Put GOTO address in DE
+	LD   HL,$0018           ; offset to exec address on stack
+	ADD  HL,SP              ; make pointer
+	DEC  HL                 
+	LD   (HL),D             ; Store User Jump Address
+	DEC  HL                 ;
+	LD   (HL),E
+        CP   $2C                ; Comma? User is Entering a Breakpoint also     
+	JP   NZ,EXIT            ; End of Breakpoints? Pop everything and RET    
+	CALL GET4H              ; Get XXXX from user for Breakpoint     
+	RET  C                  ; Cancel if he <Ctrl-C>'s us    
+	LD   A,(HL)             ; Save original memory contents
+	LD   (BKDATA),A         ;
+	LD   (BKPTR),HL         ; Save the address of the Breakpoint
+	LD   (HL),$FF           ; Swap instruction at (HL) for a RST 38H.
+	JP   EXIT               ; goto user addresss
+
+;-------------------------------------------------------------------------------
+; Kill / Remove Breakpoint K
+;-------------------------------------------------------------------------------
+BREAKP  LD   HL,(BKPTR)         ; Get brk address
+	LD   A,(BKDATA)         ; Recall original contents      
+	LD   (HL),A             ; Write it back 
+	RET                     ; And finish.   
+
+;-------------------------------------------------------------------------------
+; Display User Stack Register Q
+;-------------------------------------------------------------------------------
+DSTACK  CALL PR_SPC             ; Print space
+	LD   HL,$0018           ; size of stack frame
+	ADD  HL,SP              ; point to stack frame
+	JP   PRT_HL             ; Convert and TXA contents of HL        
+
+;-------------------------------------------------------------------------------
+; Input Port command INN           
+;-------------------------------------------------------------------------------
+INPUT   CALL GET4H              ; Get input address
+	RET  C                  ; Break?
+	CALL PR_CRLF            ; TXCRLF        
+	LD   C,L                ; Load the port address into C
+	IN   A,(C)              ; Get the data
+	JP   PR2HEX             ; print ASCII and return
+
+;-------------------------------------------------------------------------------
+; Output Port command ONN,BB
+;-------------------------------------------------------------------------------
+OUTPUT  CALL GET2ADR            ; Get port,value
+	RET  C                  ; Break?
+	LD   C,E                ; Port address into C           
+	OUT  (C),L              ; Output the yy data to the port address
+	RET                             
+
+;-------------------------------------------------------------------------------
+; Hex Sum/Difference command HXXXX,YYYY
+;-------------------------------------------------------------------------------
+HEXDIF  CALL GET2ADR            ; Get 2 hex numbers
+	RET  C                  ; Break?
+	CALL PR_CRLF            ; TXCRLF        
+	EX   DE,HL              ; Swap the values       
+	ADD  HL,DE              ; Do the addition               
+	CALL HLSLASH            ; Convert and print the contents of HL
+	SUB  A                  ; Zero out A, clear CY (borrow flag)            
+	SBC  HL,DE              ; Do the subtract               
+	SBC  HL,DE              ; Do it again to get the actual subtract
+	JP   PRT_HL             ; Convert and print contents of HL              
+
+;-------------------------------------------------------------------------------
+; Put ASCII string into memory PNNNN
+;-------------------------------------------------------------------------------
+PUTASC  CALL GET4H              ; Get address
+	RET  C                  ; Break if <Ctrl-C>     
+	CALL PR_CRLF            ; TXCRLF        
+PASC01  CALL GETCHE             ; RX a Character        
+	CP   $03                ; Break?        
+	JP   Z,PRT_HL           ; Convert and TXA contents of HL
+	LD   (HL),A             ; Store character into memory
+	INC  HL                 ; Next location
+	JR   PASC01             ; Continue getting characters until user breaks out
+ 
+;-------------------------------------------------------------------------------
+; Type ASCII from memory command TXXXX,YYYY
+;  This can screw up your terminal because it will print everything
+;  including control codes
+;-------------------------------------------------------------------------------
+TYPE    CALL GET2ADR            ; Get start,end address
+	RET  C			; Break?
+	CALL PR_CRLF            ; TXCRLF        
+TYPE01  LD   A,(DE)             ; Load the Accum from location at DE
+	RST  08H                ; And TXA it.                           
+	CALL CPHLDE             ; Compare HL=DE, Z if =
+	RET  Z                  ; Exit when finished
+	INC  DE                 ; Get next memory location      
+	RST  18H                ; Check SIO ready status        
+	RET  NZ                 ; Exit if user has hit a key
+	JR   TYPE01             ; Otherwise, continue on until finished 
+;-------------------------------------------------------------------------------
+; Register display command R<CR>|<`>
+;-------------------------------------------------------------------------------
+REGCMD  CALL REGPTR             ; Select register set
+REGC01  CALL PR_CRLF            ; TXCRLF
+	LD   A,(DE)             ; Get beginning text into accumulator
+	CP   $FF                ; See if we're at the end of the text yet       
+	RET  Z                  ; Exit if we are        
+	CALL PRREG              ; Print register text 4 bytes at a time 
+	JR   REGC01             ; Keep going until we are done. 
+
+;------------------------------------------------------------------------------
+; Characters for Register command to print
+; 5 character fields.
+; if last char=' ' register is 8bit X=16bit
+; $FF is end of table
+;------------------------------------------------------------------------------
+STRREG  .BYTE   " PC=X"
+	.BYTE   "  A= "
+	.BYTE   "  F= "
+	.BYTE   "  B= "
+	.BYTE   "  C= "
+	.BYTE   "  D= "
+	.BYTE   "  E= "
+	.BYTE   " HL=X"
+	.BYTE   " IX=X"
+	.BYTE   " IY=X"
+	.BYTE   $FF             ; end marker
+
+STRALT  .BYTE   " A`= "
+	.BYTE   " F`= "
+	.BYTE   " B`= "
+	.BYTE   " C`= "
+	.BYTE   " D`= "
+	.BYTE   " E`= "
+	.BYTE   "HL`=X"
+	.BYTE   $FF             ; end marker
+
+;------------------------------------------------------------------------------
+; Print register name followed by 1 or 2 bytes
+; of register data
+;------------------------------------------------------------------------------         
+PRREG   LD   C,$04              ; length of name
+PRREG1  LD   A,(DE)             ; Load text at (DE)     
+	INC  DE                 ; Get next location     
+	RST  08H                ; Print current text byte       
+	DEC  C                  ; Decrement the counter 
+	JR   NZ,PRREG1          ; and Repeat until all 4 bytes are printed      
+	DEC  HL                 ; Decrement the register pointer  
+	LD   A,(HL)             ; Load it's contents in the accumulator 
+	CALL PR2HEX             ; Convert A to ascii in BC and print it
+	LD   A,(DE)             ; Get next text string of registers     
+	INC  DE                 ; Update the location   
+	CP   $58                ; An "X" indicates 2 byte value (HL,DE,IX,IY)
+	RET  NZ                 ; Return if only 1 byte value needed    
+	DEC  HL                 ; Else get pointer to next byte 
+	LD   A,(HL)             ; Load it into A        
+	JP   PR2HEX             ; Convert it to ASCII and print it.
+		
+;------------------------------------------------------------------------------
+; Select the prime or alt register set
+;------------------------------------------------------------------------------         
+REGPTR  CALL GETCHE             ; get argument <CR> or <'>
+	LD   HL,$1A             ; reg offset on stack
+	ADD  HL,SP              ;
+	LD   DE,STRREG          ; text for Primary registers
+	CP   $27                ; Has user hit <'> for the Alternate Registers?
+	RET  NZ                 ; If not, we've got the right ones then
+	LD   HL,$0C             ; Move pointer not quite so far for alternate registers
+	ADD  HL,SP              ; Stack plus the new start of registers
+	LD   DE,STRALT          ; text for Alternate registers
+	RET
+;-------------------------------------------------------------------------------
+; Edit registers
+;-------------------------------------------------------------------------------
+EDITR   CALL REGPTR             ; Set reg pointer
+EDITR1  CALL PR_CRLF            ; TXCRLF
+	LD   A,(DE)             ; Load variable space info (user registers)
+	CP   $FF                ; Reached the end of the text yet?
+	RET  Z                  ; Quit when finished.
+	CALL PRREG              ; Print register text 4 bytes at a time 
+	CALL PSLASH             ; Print "/ " + contents of BC
+	PUSH HL                 ; Store register value location
+	CALL GET4HA             ; Get 4 characters into HL
+	PUSH HL                 ; and move it into
+	POP  BC                 ; B and C
+	POP  HL                 ; Get original register value location
+	PUSH AF                 ; Save last character user sent
+	JR   NC,EDITR3          ; Store the new data there
+		
+EDITR2  POP  AF                 ; Get the last user character back
+	CP   $20                ; Was it a <space>?     
+	JR   Z,EDITR1           ; Get set up to do the next registers                   
+	CP   $0A                ; <LF>?
+	JR   Z,EDITR1           ; Space or LF continues on to edit other
+	RET                     ; registers, otherwise we are finished
+		
+EDITR3  LD   (HL),C             ; Store new register info to memory
+	DEC  DE                 ; Where it will be picked up by a Go command
+	LD   A,(DE)             ; Store it there
+	INC  DE                 ; Get next location if needed for 16 bit registers
+	CP   $58                ; Is it "X" ?   
+	JR   NZ,EDITR2          ; Only 8 bits needed for basic reg (a,b,c,d,e)
+	INC  HL                 ; Must be 16 bit register set (HL,SP,IX,IY)
+	LD   (HL),B             ; so write that byte also
+	DEC  HL                 ; Set up for the next location
+	JR   EDITR2             ; And see what the user wants to do next
+
+;-------------------------------------------------------------------------------
+; Move command MXXXX,YYYY,ZZZZ
+;-------------------------------------------------------------------------------        
+MOVE    CALL GETARG             ; Get start,end,dest
+	RET  C                  ; Break?
+	POP  IX                 ; get return address (in case it gets clobbered)
+	LDIR                    ; Make the big move
+	JP   (IX)               ; and go back to normal monitor entry point.
+
+;-------------------------------------------------------------------------------
+; Fill command FXXXX,YYYY,ZZ         
+;-------------------------------------------------------------------------------
+FILL    CALL GETARG             ; Get start,end,fill
+	RET  C                  ; Break?
+	POP  IX                 ; Get return addressy (in case it gets clobbered)
+FILL01  LD   (HL),E             ; Load new fill value into destination memory
+	INC  HL                 ; Increment to the next location
+	DEC  BC                 ; Count down.
+	LD   A,B                ; Check BC to see if it's zero yet
+	OR   C          
+	JR   NZ,FILL01          ; Check to see if we're finished, else loop back.
+	JP   (IX)               ; Jump back to monitor normal entry point.
+
+;-------------------------------------------------------------------------------
+; Compare command CXXXX,YYYY,ZZZZ
+;-------------------------------------------------------------------------------        
+COMPARE CALL GETARG             ; Get start,end,count
+	RET  C                  ; May quit and go home early today
+COMPR1  LD   A,(DE)             ; Get the byte from memory      
+	CP   (HL)               ; Check it against the other location
+	JP   NZ,PRTMEM          ; Jump out if something's not right
+	INC  DE                 ; Otherwise proceed as normal, get next target
+	INC  HL                 ; and the next source
+COMPR2  DEC  BC                 ; take one off the byte counter (BC)
+	LD   A,B                ; Check the byte counter to see where we are
+	OR   C                  ; See if we're done yet
+	JR   NZ,COMPR1          ; Continue the compare until we get all the way done
+	RET                     ; If we are, we can RETurn home
+
+;-------------------------------------------------------------------------------
+; HLOUT - Convert and transmit contents of HL register
+;-------------------------------------------------------------------------------
+PRT_HL  LD   A,H                ; Convert and TXA contents of H and L
+	CALL PR2HEX             ; Convert H into ASCII BC and print it
+	LD   A,L                ; Convert L
+PR2HEX  CALL TO_HEX             ; Convert byte to ASCII
+	JR   OUT2CH             ; Send B and C to TXA and use that RETurn
+
+;-------------------------------------------------------------------------------
+; Print contents of HL registers, plus "/ ",
+; and the contents of memory at location (HL)
+;-------------------------------------------------------------------------------
+PRTMEM  CALL PR_CRLF            ; TXCRLF
+	CALL HLSLASH            ; Print HL contents + "/ "
+	LD   A,(HL)             ; Get Memory contents at (HL)
+	JR   PR2HEX             ; Convert A to Ascii in BC and Print it 
+		
+;-------------------------------------------------------------------------------
+; Print HL then slash
+;-------------------------------------------------------------------------------
+HLSLASH CALL PRT_HL             ; Convert and Print Contents of HL
+
+;-------------------------------------------------------------------------------
+; Print "/ "
+;-------------------------------------------------------------------------------
+PSLASH  LD   BC,$2F20           ; Load "/ " in BC
+	JR   OUT2CH             ; and TX        it out.
+
+;-------------------------------------------------------------------------------
+; Print banner
+;-------------------------------------------------------------------------------
+SIGNON  LD   HL,BANNER          ; Print "SBC Monitor VX.X"
+
+;-------------------------------------------------------------------------------
+; Print CRLF then string pointed to by HL
+;-------------------------------------------------------------------------------
+PRCRSTR CALL PR_CRLF            ; TXCRLF
+
+;-------------------------------------------------------------------------------
+; Print (HL) number of bytes, starting with ASCII characters from
+; (HL+1) until end
+;-------------------------------------------------------------------------------
+OUTSTR  LD   E,(HL)             ; Get byte count
+OUTST1  INC  HL                 ; Move to start of text
+	LD   A,(HL)             ; And get that character into A
+	RST  08H                ; Print it
+	DEC  E                  ; Decrement the character counter
+	JR   NZ,OUTST1          ; Until all (E) characters are TXA'd
+
+;-------------------------------------------------------------------------------
+; Print CR LF
+;-------------------------------------------------------------------------------
+PR_CRLF LD   BC,$0D0A           ; Get CR LF
+
+;-------------------------------------------------------------------------------
+; BCOUT - Ascii characters in BC are transmitted
+;-------------------------------------------------------------------------------
+OUT2CH  LD   A,B                ; Get char from B
+	RST  08H                ; Print character from B
+	LD   A,C                ; Get character from C
+	RST  08H                ; Print character from C
+	RET
+
+;-------------------------------------------------------------------------------
+BANNER  .BYTE   20,"Z80 SBC"
+	.BYTE   " Monitor V0.1"
+	
+;-------------------------------------------------------------------------------
+; Get 3 comma sep arguments XXXX,YYYY,ZZZZ
+; XXXX in HL,YYYY in DE,ZZZZ in BC
+;-------------------------------------------------------------------------------
+GETARG  CALL GET2ADR            ; GET 2 addresses
+	RET  C                  ; Break?
+	SBC  HL,DE              ; Create a byte count for this op
+	INC  HL                 ; Correct for the subtraction
+	PUSH HL                 ; and save it temporarily
+	CALL GET4H              ; GET zzzz From User (destination or value)
+	POP  BC                 ; Put byte counter in BC
+	EX   DE,HL              ; Flip so that Start=HL, End=DE
+	RET                     ; and Byte Count=BC
+
+;-------------------------------------------------------------------------------
+; Gets four Hex characters from the console, convert them to value in HL
+;-------------------------------------------------------------------------------
+GET4HA  LD   HL,$0000           ; Init return value
+	CALL GETCHE             ; Get and echo a Character
+	CP   $20                ; Did he give us some <space>?
+	JR   Z,GET4H1           ; Set the carry and quit
+	CP   $0A                ; Did he feed us a linefeed <LF>?
+	JR   Z,GET4H1           ; Set the carry and quit
+	CP   $0D                ; Is he trying to return his carriage <CR>?
+	JR   NZ,GT4HX2          ; Hmm must be some other key            
+GET4H1  SCF                     ; Set Carry Flag
+	RET                     ; and Return to main program            
+
+;-------------------------------------------------------------------------------
+; This routine converts last four hex characters (0-9 A-F) user types
+; into a value in HL. Rotates the old out and replaces with the new until
+; the user hits a terminating character
+;-------------------------------------------------------------------------------
+GET4H   LD   HL,$0000           ; Init return value
+GT4HX1  CALL GETCHE             ; RX a character from the console
+	CP   $20                ; space terminator?
+	RET  Z                  ; return
+	CP   $0A                ; <LF> terminator?
+	RET  Z                  ; return
+	CP   $0D                ; <CR>
+	RET  Z                  ; return
+	CP   $2C                ; separator? <,> for multiple entries
+	RET  Z                  ; return
+GT4HX2  CP   $03                ; <ctrl-C> return with carry set
+	JR   Z,GET4H1           ; for testing later.
+	ADD  HL,HL              ; shift result left 4 places
+	ADD  HL,HL              ; by adding
+	ADD  HL,HL              ;
+	ADD  HL,HL              ;
+	SUB  $30                ; remove ASCII bias
+	CP   $0A                ; Are we in the 0-9 range?
+	JR   C,GT4HX3           ; Adjust for A-F
+	SUB  $07                ; correct for A-F
+GT4HX3  AND  $0F                ; strip off hi bits
+	ADD  A,L                ; Add to result
+	LD   L,A                ; Move the byte back to L
+	JR   GT4HX1             ; and go back for next character
+
+;-------------------------------------------------------------------------------        
+; Get 2 comma separated hex values XXXX,YYYY
+; XXXX in DE and YYYY in HL
+;-------------------------------------------------------------------------------
+GET2ADR CALL GET4H              ; Get the first four hex characters into HL
+	RET  C                  ; But break out if he terminates
+	EX   DE,HL              ; Put it in DE, go back again for yyyy
+	JR   GET4H              ; and get four more chars to put in HL.         
+;-------------------------------------------------------------------------------
+; Convert HEX ASCII characters in B C registers to a byte value in A
+;-------------------------------------------------------------------------------
+HEX2BIN LD   A,B                ; Move the hi order byte to A
+	SUB  $30                ; Take it down from Ascii
+	CP   $0A                ; Are we in the 0-9 range here?
+	JR   C,HX2B01           ; If so, get the next nybble
+	SUB  $07                ; But if A-F, take it down some more
+HX2B01  RLCA                    ; Rotate the nybble from low to high
+	RLCA                    ; One bit at a time
+	RLCA                    ; Until we
+	RLCA                    ; Get there with it
+	LD   B,A                ; Save the converted high nybble
+	LD   A,C                ; Now get the low order byte
+	SUB  $30                ; Convert it down from Ascii
+	CP   $0A                ; 0-9 at this point?
+	JR   C,HX2B02           ; Good enough then, but
+	SUB  $07                ; Take off 7 more if it's A-F
+HX2B02  ADD  A,B                ; Add in the high order nybble
+	RET
+;-------------------------------------------------------------------------------
+; Convert single byte in A to two Ascii characters in B and C
+;-------------------------------------------------------------------------------
+TO_HEX  LD   B,A                ; Save the byte original value
+	AND  $0F                ; Strip off the high order nybble
+	CP   $0A                ; 0-9 at this point?
+	JR   C,TOHX01           ; We only need to add $30 then, or
+	ADD  A,$07              ; Seven more if it's in the A-F range
+TOHX01  ADD  A,$30              ; Take the value on up to ASCII
+	LD   C,A                ; Store the converted lo order character to C
+	LD   A,B                ; Get the original value back
+	RRCA                    ; Rotate it to the right
+	RRCA
+	RRCA
+	RRCA
+	AND  $0F                ; Mask off the upper trash
+	CP   $0A                ; 0-9 (< $0A)?
+	JR   C,TOHX02           ; Only add $30 then
+	ADD  A,$07              ; And add it 7 if it's in the A-F range
+TOHX02  ADD  A,$30              ; Finish the conversion to ASCII
+	LD   B,A                ; Load the finished hi order character to B
+	RET                     ;
+
+;------------------------------------------------------------------------------
+; LOAD Intel Hex format file from the console.
+; [Intel Hex Format is:
+; 1) Colon (Frame 0)
+; 2) Record Length Field (Frames 1 and 2)
+; 3) Load Address Field (Frames 3,4,5,6)
+; 4) Record Type Field (Frames 7 and 8)
+; 5) Data Field (Frames 9 to 9+2*(Record Length)-1
+; 6) Checksum Field - Sum of all byte values from Record Length to and 
+;   including Checksum Field = 0 ]
+;------------------------------------------------------------------------------        
+LOAD    CALL PR_CRLF            ; TX CRLF
+LOAD01  CALL GET_CH             ; Get character
+	CP   $03                ; Break?
+	RET  Z                  ; Return him to the prompt
+	CP   $3A                ; Colon <:>? Start of line of Intel Hex file
+	JR   NZ,LOAD04          ; If not, must be error, Tell him and quit
+	LD   E,0                ; First two Characters is the Record Length Field
+	CALL GET2H              ; Get us two characters into BC, convert it to a byte <A>
+	LD   D,A                ; Load Record Length count into D
+	CALL GET2H              ; Get next two characters, Memory Load Address <H>
+	LD   H,A                ; put value in H register.
+	CALL GET2H              ; Get next two characters, Memory Load Address <L>
+	LD   L,A                ; put value in L register.
+	CALL GET2H              ; Get next two characters, Record Field Type
+	CP   $01                ; Record Field Type 00 is Data, 01 is End of File
+	JR   NZ,LOAD02          ; Must be the end of that file
+	CALL GET2H              ; Get next two characters, assemble into byte
+	LD   A,E                ; Recall the Checksum byte
+	AND  A                  ; Is it Zero?
+	RET  Z                  ; Must be o.k., go back for some more, else
+	JR   LOAD04             ; Checksums don't add up, Error out
+		
+LOAD02  LD   A,D                ; Retrieve line character counter       
+	AND  A                  ; Are we done with this line?
+	JR   Z,LOAD03           ; Get two more ascii characters, build a byte and checksum
+
+	CALL GET2H              ; Get next two chars, convert to byte in A, checksum it
+	LD   (HL),A             ; Checksum OK, move converted byte in A to memory location
+	INC  HL                 ; Increment pointer to next memory location     
+	DEC  D                  ; Decrement line character counter
+	JR   LOAD02             ; and keep loading into memory until line is complete
+		
+LOAD03  CALL GET2H              ; Get two chars, build byte and checksum
+	LD   A,E                ; Check the checksum value
+	AND  A                  ; Is it zero?
+	JR   Z,LOAD01           ; If the checksum is still ok, continue on, else
+LOAD04  LD   HL,MS_CSE          ; Get "Checksum Error" message
+	JP   PRCRSTR            ; Print Message from (HL) and terminate the load
+		
+MS_CSE  .BYTE   $0E             ; $0E characters to follow
+	.BYTE   "CHECKSUM ERROR"
+
+;-------------------------------------------------------------------------------
+; Get a character from the console without echo
+; must be $20-$7F to be valid (no control characters)
+; <Ctrl-c> breaks with the Zero Flag set
+;-------------------------------------------------------------------------------        
+GET_CH  RST  10H                ; RX a Character
+	CP   $03                ; <ctrl-c> User break?
+	RET  Z                  
+	CP   $20                ; <space> or better?
+	JR   C,GET_CH            ; Do it again until we get something usable
+	RET
+
+;-------------------------------------------------------------------------------
+; Gets two HEX ASCII characters from the console without echo and add to checksum
+; Moves them into B and C, converts them into a byte value in A and updates a
+; Checksum value in E
+;-------------------------------------------------------------------------------
+GET2H   CALL GET_CH             ; Get us a valid character to work with
+	LD   B,A                ; Load it in B
+	CALL GET_CH             ; Get us another character
+	LD   C,A                ; load it in C
+	CALL HEX2BIN            ; Convert ASCII to byte
+	LD   C,A                ; Build the checksum
+	LD   A,E
+	SUB  C                  ; The checksum should always equal zero when checked
+	LD   E,A                ; Save the checksum back where it came from
+	LD   A,C                ; Retrieve the byte and go back
+	RET
+
+;-------------------------------------------------------------------------------
+; Default SCSI CDB for boot
+;-------------------------------------------------------------------------------
+B_DATA:
+	.BYTE $08	;read6 command
+B_LUN:
+	.BYTE 0		;LUN 0
+	.BYTE 0
+	.BYTE 0		;LBN 0
+	.BYTE 1		;1 block
+	.BYTE 0		;options=0
+;
+;spare CDB bytes
+	.BYTE 0
+	.BYTE 0
+	.BYTE 0
+	.BYTE 0
+	.BYTE 0
+	.BYTE 0
+;
+;------------------------------------------------------------------------------
+;default IO table
+;------------------------------------------------------------------------------
+B_TID:
+	.BYTE 2		;target ID
+	.BYTE 0		;spare
+	.WORD SCCDB	;pointer to CDB
+	.WORD SCSTAT	;pointer to status
+	.WORD SCBUFF	;pointer to data out
+	.WORD SCBUFF	;pointer to data in
+	.WORD SCMSGO	;pointer to MSG out
+	.WORD SCMSGI	;pointer to MSG in
+
+;------------------------------------------------------------------------------
+; SCSI TEST routine
+; I initialize SCSI pointers and CDB
+; R issue SCSI reset
+; C build SCSI command block
+; E execute SCSI command
+; D display buffer contents
+; X return to monitor
+;------------------------------------------------------------------------------
+SC_TEST:
+	CALL PR_CRLF		; issue CR LF
+	LD   A,$3A              ; Prompt char ":"     
+	RST  08H                ; And TX it out.
+	CALL GETCHE		; get command
+;
+;decode command
+;
+	CP 'I'			; is it I
+ 	JR NZ,NOT_I		;
+ 
+;-------------------------------------------------------------------------------
+;intialize CDB AND IOT
+;
+	CALL S_ICDB		;init command block and IOT
+	JR SC_TEST
+;
+NOT_I:
+	CP 'R'			; is it R
+	JR NZ,NOT_R		;
+ 
+;-------------------------------------------------------------------------------
+;reset SCSI bus
+;
+	CALL S_RESET		;
+	JR SC_TEST
+;
+NOT_R:
+	CP 'C'			; is it C
+	JR NZ,NOT_C		;
+ 
+;-------------------------------------------------------------------------------
+;enter (edit) CDB
+;
+	LD HL,SCCDB		; point to CDB
+	CALL SUBST1		; edit memory
+	JR SC_TEST		; get another command
+;
+NOT_C:
+	CP 'E'			; is it E
+	JR NZ,NOT_E		;
+ 
+;-------------------------------------------------------------------------------
+; execute SCSI command
+;
+	CALL PR_SPC		; print space
+	LD IX,SCIOT		; point to IO table 
+	CALL S_GO		; execute SCSI command
+	CALL PR2HEX		; print return status
+	JR SC_TEST		; get another command
+;
+NOT_E:
+	CP 'D'			; is it D
+	JR NZ,NOT_D		;
+ 
+;-------------------------------------------------------------------------------
+;dump buffer contents
+;
+	LD HL,SCBUFF		; start address
+	LD DE,SCBUFF+512	; end address
+	CALL DUMPM1		; dump buffer
+	JR SC_TEST		; get another command
+;
+NOT_D:
+	CP 'X'			; is it X
+	JR NZ,NOT_X		;
+;
+	RET			; exit
+;-------------------------------------------------------------------------------
+;not a valid command print "?" and go back
+;
+NOT_X:
+	LD A,$3F		; question mark
+	RST  08H                ; And TX it out.
+	JP SC_TEST
+
+;-------------------------------------------------------------------------------
+;init CDB and IOT
+;-------------------------------------------------------------------------------
+S_ICDB:
+	LD HL,B_DATA	;point to boot data
+	LD DE,SCCDB	;dest in ram
+	LD BC,26	;byte count
+	LDIR		;block move
+	RET
+
+;-------------------------------------------------------------------------------
+; Boot 
+; Load drive 1 sector 0 into buffer and execute it
+;-------------------------------------------------------------------------------
+BOOT:
+	CALL S_ICDB	;init CDB and IOT
+	LD B,2		;retry count
+BOOT1:
+	PUSH BC
+;
+;do scsi command
+	LD IX,SCIOT	;point to io block
+	CALL S_GO	;do SCSI io
+;
+	AND $1F		;mask to error bits
+	JP Z,SCBUFF	;good read exec loader
+	POP BC		;recover retry count
+	DEC B		;dec retry
+	JR NZ,BOOT1	;loop if more trys
+	JP ERROR	;boot failed
+
+;-------------------------------------------------------------------------------
+;Generate SCSI bus reset
+;-------------------------------------------------------------------------------
+S_RESET:
+	LD A,$80
+	OUT (SR_ICR),A	;assert scsi reset
+S_RST1:
+	NOP
+	NOP
+	DEC A
+	JR NZ,S_RST1
+	OUT (SR_ICR),A	;release scsi reset
+;
+	LD BC,0
+S_DELY:
+	CALL S_KT	;kill time
+	DEC BC
+	LD A,B
+	OR C
+	JR NZ,S_DELY	;loop till done
+	IN A,(SR_RPI)	;reset IRQ status
+	RET
+
+S_KT:
+	NOP		;kill time
+	NOP
+	NOP
+	NOP
+	RET
+;-------------------------------------------------------------------------------
+;Do SCSI transaction
+; IX=scsi IO block
+;-------------------------------------------------------------------------------
+S_GO:
+	LD A,$FF	;preset error status
+	LD L,(IX+4)	;point to status address
+	LD H,(IX+5)	;point to status address
+	LD (HL),A	;set error to timeout ($FF)
+;
+	XOR A		;
+	OUT (SR_MR),A	;reset control reg
+	OUT (SR_TCR),A	;clear command reg.
+	OUT (SR_ICR),A	;
+	LD A,(IX)	;get TID
+	OUT (SR_ODR),A	;set target ID
+	LD A,$01	;drive bus
+	OUT (SR_ICR),A	;
+	LD A,$05	;set sel and drive bus
+	OUT (SR_ICR),A	;
+;
+;wait for SCSI busy
+	LD BC,0		;init timeout
+S_SWT:
+	IN A,(SR_CSBS)	;get bus status
+	AND SM_BSY	;mask to busy bit
+	JR NZ,S_BSYA	;jmp if busy active
+	DEC BC		;dec timeout
+	LD A,B		;test timeout=0
+	OR C
+	JR NZ,S_SWT	;jmp if no timeout
+	XOR A		;clear A
+	OUT (SR_ICR),A	;clear SEL and data
+	JR S_EXIT	;error exit
+;
+;busy is active
+S_BSYA:
+	XOR A		;clear A
+	OUT (SR_ICR),A	;clear SEL and data
+
+;-------------------------------------------------------------------------------
+;Target is selected so test bsy and req
+;then decode requested phase
+;-------------------------------------------------------------------------------
+PHASE:
+	XOR A
+	OUT (SR_ICR),A	;reset initiator
+;
+S_WTREQ:
+	IN A,(SR_CSBS)	;get bus status
+	LD B,A		;save copy
+	AND SM_BSY	;mask to busy bit
+	JR NZ,S_WTRQ1	;still busy so cont.
+
+;-------------------------------------------------------------------------------
+;busy lost so exit
+;-------------------------------------------------------------------------------
+S_EXIT:
+	LD L,(IX+4)	;get status pointer
+	LD H,(IX+5)	;get status pointer
+	LD A,(HL)	;get final status
+	RET		;busy lost? were done
+;
+S_WTRQ1:
+	LD A,B		;recover status
+	AND SM_REQ	;request active?
+	JR Z,S_WTREQ	;loop till request
+
+;-------------------------------------------------------------------------------
+;request is active so set 5380 to requested phase
+;-------------------------------------------------------------------------------
+	LD A,B		;recover bus status
+	RR A
+	RR A
+	AND $07		;mask to phase bits
+	OUT (SR_TCR),A	;set phase
+;
+;jump to phase handler
+;
+	LD A,B		;recover bus status 
+	RR A
+	AND $0E		;mask to phase bits
+	LD E,A
+	LD D,0
+	LD HL,PHTABL	;point to table
+	ADD HL,DE	;offset into table
+	LD E,(HL)
+	INC HL
+	LD D,(HL)
+	PUSH DE
+	RET		;execute phase
+
+;-------------------------------------------------------------------------------
+;phase table
+;-------------------------------------------------------------------------------
+PHTABL:
+	.WORD	PHASE0	;data out
+	.WORD	PHASE1	;data in
+	.WORD	PHASE2	;cmd out
+	.WORD	PHASE3	;status in
+	.WORD	S_EXIT	;unused
+	.WORD	S_EXIT	;unused
+	.WORD	PHASE6	;message out
+	.WORD	PHASE7	;message in
+
+;-------------------------------------------------------------------------------
+;phase handlers
+;-------------------------------------------------------------------------------
+;
+;DATA OUT
+PHASE0:
+	LD L,(IX+6)
+	LD H,(IX+7)
+	JP S_WRIT
+;
+;DATA IN
+PHASE1:
+	LD L,(IX+8)
+	LD H,(IX+9)
+	JP S_READ
+;
+;CMD OUT
+PHASE2:
+	LD L,(IX+2)
+	LD H,(IX+3)
+	JP S_WRIT
+;
+;STATUS IN
+PHASE3:
+	LD L,(IX+4)
+	LD H,(IX+5)
+	JP S_READ
+;
+;MSG OUT
+PHASE6:
+	LD L,(IX+10)
+	LD H,(IX+11)
+	JP S_WRIT
+;
+;MSG IN
+PHASE7:
+	LD L,(IX+12)
+	LD H,(IX+13)
+	JP S_READ
+
+;-------------------------------------------------------------------------------
+;SCSI write routine (send bytes to target)
+;-------------------------------------------------------------------------------
+S_WRIT:
+	LD A,1		;drive SCSI data bus
+	OUT (SR_ICR),A
+;
+;wait for req while checking busy
+;
+S_WWREQ:
+	IN A,(SR_CSBS)	;get current bus stat
+	LD B,A		;save it
+	AND SM_REQ	;request active?
+	JR NZ,S_WNXT	;
+;
+	LD A,B		;recover current bus stat
+	AND SM_BSY	;still busy?
+	JP NZ,S_WWREQ	;loop if stil busy
+	JP PHASE	;
+;
+;request active so check phase
+;
+S_WNXT:
+	IN A,(SR_BSR)	;get status
+	AND SM_PHM	;mask to phase match
+	JP Z,PHASE	;jmp if phase mismatch
+;
+;request active and phase match so send data
+;
+	LD A,(HL)	;get byte
+	OUT (SR_ODR),A	;send data
+	LD A,$11	;ack and data
+	OUT (SR_ICR),A	;set ack,drive scsi bus
+	INC HL
+;
+;wait for request to drop
+;
+S_WNREQ:
+	IN A,(SR_CSBS)	;get current status
+	AND SM_REQ
+	JR NZ,S_WNREQ	;loop till req drops
+;
+	LD A,$1		;drop ack,assert data
+	OUT (SR_ICR),A	;drop ACK
+	JP S_WWREQ	;loop for next byte/phase
+
+;-------------------------------------------------------------------------------
+;SCSI read routine (get bytes from target)
+;-------------------------------------------------------------------------------
+;
+S_READ:
+;
+;wait for req while checking busy
+;
+S_RWREQ:
+	IN A,(SR_CSBS)	;get current bus stat
+	LD B,A		;save it
+	AND SM_REQ	;request active?
+	JR NZ,S_RNXT	;
+;
+	LD A,B		;recover current bus stat
+	AND SM_BSY	;still busy?
+	JP NZ,S_RWREQ	;loop if stil busy
+	JP PHASE	;
+;
+;request active so check phase
+S_RNXT:
+	IN A,(SR_BSR)	;get status
+	AND SM_PHM	;mask to phase match
+	JP Z,PHASE	;jmp if phase mismatch
+;
+;request active and phase match so get data
+;
+	IN A, (SR_CSD)	;get current SCSI data
+	LD (HL),A	;save data
+	LD A,$10
+	OUT (SR_ICR),A	;set ack
+	INC HL		;advance buf pointer
+;
+;wait for request to drop
+;
+S_RNREQ:
+	IN A,(SR_CSBS)	;get current status
+	AND SM_REQ
+	JR NZ,S_RNREQ	;loop till req drops
+	XOR A
+	OUT (SR_ICR),A	;drop ACK
+	JP S_READ	;loop for next byte/phase
+
+;-------------------------------------------------------------------------------
+; INITIALIZE HARDWARE
+;-------------------------------------------------------------------------------
+HINIT:
+;
+	IM 1		;set irq mode
+;
+; initialize ns16550
+;
+	LD  A,87H       ;SET WL,STOP,DLAB
+	OUT (UART+3),A  ;
+	LD  A,00H       ;SET DIVISOR LOW
+	OUT (UART+1),A  ;
+	LD  A,0CH       ;SET DIVISOR HI
+	OUT (UART),A    ;
+	LD  A,07H       ;CLEAR DLAB BIT
+	OUT (UART+3),A  ;
+	LD  A,00H       ;CLEAR IEN
+	OUT (UART+1),A  ;
+	OUT (UART+4),A  ;
+;
+;Initialize SCSI NCR 5380 chip
+;
+	XOR A		;clear a
+	OUT (SR_ICR),A
+	OUT (SR_MR),A
+	OUT (SR_TCR),A
+	OUT (SR_SER),A
+	CALL S_RESET	;reset SCSI bus
+	RET
+
+;-------------------------------------------------------------------------------
+FINIS       .END
