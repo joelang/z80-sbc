@@ -1,0 +1,1100 @@
+0001   0000             ;----------------------------------------------------------------
+0002   0000             ;
+0003   0000             ;	CP/M ver. 2.2 bios for sbc z80 board
+0004   0000             ;	NCR5380 SCSI NS16550 serial
+0005   0000             ;	J.C.Lang 12/15/2017
+0006   0000             ;
+0007   0000             ;----------------------------------------------------------------
+0008   0000             	.page
+0009   0000             	.title "CP/M Version 2.2 bios"
+0010   0000             ;
+0011   0000             sysdsk	.equ	2		;system disk (C:)
+0012   0000             ;
+0013   0000             ccp	.equ	0dc00h		;base of ccp
+0014   0000             bdos	.equ	0e406h		;bdos entry
+0015   0000             bios	.equ	0f200h		;base of bios
+0016   0000             curdsk	.equ	0004h		;address of current disk number
+0017   0000             iobyte	.equ	0003h		;intel i/o byte
+0018   0000             disks	.equ	04h		;number of disks in the system
+0019   0000             ;
+0020   F200             	.org	bios		;origin of this program
+0021   F200             nsects	.equ	($-ccp)/512	;warm start sector count
+0022   F200             
+0023   F200             ;----------------------------------------------------------------
+0024   F200             ;io port addresses
+0025   F200             ;----------------------------------------------------------------
+0026   F200             uart    .equ    $80		;NS16550 base address
+0027   F200             scsi    .equ    $88		;NCR5380 base address
+0028   F200             ;
+0029   F200             ;ncr 5380 i/o registers
+0030   F200             sr_csd	.equ	scsi		;current SCSI data
+0031   F200             sr_icr	.equ	scsi+$01	;initiator command
+0032   F200             sr_mr	.equ	scsi+$02	;mode
+0033   F200             sr_tcr	.equ	scsi+$03	;target command
+0034   F200             sr_csbs	.equ	scsi+$04	;current SCSI bus stat.
+0035   F200             sr_bsr	.equ	scsi+$05	;bus status
+0036   F200             sr_idr	.equ	scsi+$06	;initiator DMA recv.
+0037   F200             sr_rpi	.equ	scsi+$07	;reset parity/irq
+0038   F200             ;
+0039   F200             ;ncr 5380 output only registers
+0040   F200             sr_odr	.equ	scsi		;output data
+0041   F200             sr_ser	.equ	scsi+$04	;select enable
+0042   F200             sr_sds	.equ	scsi+$05	;start DMA send
+0043   F200             sr_sdtr	.equ	scsi+$06	;start target DMA recv.
+0044   F200             sr_sdir	.equ	scsi+$07	;start initiator DMA recv.
+0045   F200             ;
+0046   F200             ;SCSI current bus status bit masks
+0047   F200             sm_rst	.equ	$80		;reset
+0048   F200             sm_bsy	.equ	$40		;busy
+0049   F200             sm_req	.equ	$20		;request
+0050   F200             sm_msg	.equ	$10		;message
+0051   F200             sm_cd	.equ	$08		;cmd/data
+0052   F200             sm_io	.equ	$04		;in/out
+0053   F200             sm_sel	.equ	$02		;select
+0054   F200             sm_dbp	.equ	$01		;parity bit
+0055   F200             ;
+0056   F200             sm_phm	.equ	$08		;phase match bit
+0057   F200             ;
+TASM Z80 Assembler.               cbios.z80                        page 1
+CP/M Version 2.2 bios
+
+0058   F200             	.eject
+0059   F200             ;------------------------------------------------------------------------------
+0060   F200             ;	jump vector for individual subroutines
+0061   F200             ;
+0062   F200 C3 C0 F2    	jp	boot	;cold start
+0063   F203 C3 F7 F2    wboote:	jp	wboot	;warm start
+0064   F206 C3 20 F3    	jp	const	;console status
+0065   F209 C3 2D F3    	jp	conin	;console character in
+0066   F20C C3 39 F3    	jp	conout	;console character out
+0067   F20F C3 44 F3    	jp	list	;list character out
+0068   F212 C3 48 F3    	jp	punch	;punch character out
+0069   F215 C3 4A F3    	jp	reader	;reader character out
+0070   F218 C3 4F F3    	jp	home	;move head to home position
+0071   F21B C3 50 F3    	jp	seldsk	;select disk
+0072   F21E C3 85 F3    	jp	settrk	;set track number
+0073   F221 C3 8A F3    	jp	setsec	;set sector number
+0074   F224 C3 A5 F3    	jp	setdma	;set dma address
+0075   F227 C3 AA F3    	jp	rd_rec	;read disk record
+0076   F22A C3 BC F3    	jp	wr_rec	;write disk record
+0077   F22D C3 46 F3    	jp	listst	;return list status
+0078   F230 C3 8F F3    	jp	sectran	;sector translate
+0079   F233 C3 B4 F4    	jp	scsi_go	;direct scsi i/o
+TASM Z80 Assembler.               cbios.z80                        page 2
+CP/M Version 2.2 bios
+
+0080   F236             	.eject
+0081   F236             ;----------------------------------------------------------------
+0082   F236             ;	fixed data tables for four drives
+0083   F236             ;	a:,b: floppy 720k
+0084   F236             ;	c:    hard disk
+0085   F236             ;	d:    hard disk
+0086   F236             ;
+0087   F236             dpbase:
+0088   F236             ;	disk parameter header for disk 00
+0089   F236 76 F2 00 00 	.dw	trans, 0000h
+0090   F23A 00 00 00 00 	.dw	0000h, 0000h
+0091   F23E 79 F8 A9 F2 	.dw	dirbf, dpblk1
+0092   F242 79 F7 F9 F5 	.dw	chk00, all00
+0093   F246             ;
+0094   F246             ;	disk parameter header for disk 01
+0095   F246 76 F2 00 00 	.dw	trans, 0000h
+0096   F24A 00 00 00 00 	.dw	0000h, 0000h
+0097   F24E 79 F8 A9 F2 	.dw	dirbf, dpblk1
+0098   F252 B9 F7 39 F6 	.dw	chk01, all01
+0099   F256             ;
+0100   F256             ;	disk parameter header for disk 02
+0101   F256 00 00 00 00 	.dw	0000h, 0000h
+0102   F25A 00 00 00 00 	.dw	0000h, 0000h
+0103   F25E 79 F8 9A F2 	.dw	dirbf, dpblk0
+0104   F262 F9 F7 79 F6 	.dw	chk02, all02
+0105   F266             ;
+0106   F266             ;	disk parameter header for disk 03
+0107   F266 00 00 00 00 	.dw	0000h, 0000h
+0108   F26A 00 00 00 00 	.dw	0000h, 0000h
+0109   F26E 79 F8 9A F2 	.dw	dirbf, dpblk0
+0110   F272 39 F8 F9 F6 	.dw	chk03, all03
+0111   F276             
+0112   F276             ;----------------------------------------------------------------
+0113   F276             ;	sector translate table (floppy)
+0114   F276 01 02 03 04 trans:	.db	 1,  2,  3,  4	;sectors  1,  2,  3,  4
+0115   F27A 0D 0E 0F 10 	.db	13, 14, 15, 16	;sectors  5,  6,  7,  8
+0116   F27E 19 1A 1B 1C 	.db	25, 26, 27, 28	;sectors  9, 10, 11, 12
+0117   F282 05 06 07 08 	.db	 5,  6,  7,  8	;sectors 13, 14, 15, 16
+0118   F286 11 12 13 14 	.db	17, 18, 19, 20	;sectors 17, 18, 19, 20
+0119   F28A 1D 1E 1F 20 	.db	29, 30, 31, 32	;sectors 21, 22, 23, 24
+0120   F28E 09 0A 0B 0C 	.db	 9, 10, 11, 12	;sectors 25, 26. 27, 28
+0121   F292 15 16 17 18 	.db	21, 22, 23, 24	;sectors 29, 30, 31, 32
+0122   F296 21 22 23 24 	.db	33, 34, 35, 36	;sectors 33, 34, 35, 36
+TASM Z80 Assembler.               cbios.z80                        page 3
+CP/M Version 2.2 bios
+
+0123   F29A             	.eject
+0124   F29A             ;----------------------------------------------------------------
+0125   F29A             ;disk parameter block for hard disks.(8m)
+0126   F29A             ;block size=8k (BLS), 512 dir entries (DRM), 4 blocks for directory
+0127   F29A             ;15872 bytes reserved for system (31 disk blocks)
+0128   F29A             ;LBN 0 is reserved for boot loader
+0129   F29A             dpblk0:
+0130   F29A 80 00       	.dw	128		;SPT records per track
+0131   F29C 06          	.db	6		;BSH block shift factor
+0132   F29D 3F          	.db	63		;BLM block mask
+0133   F29E 03          	.db	3		;EXM null mask
+0134   F29F FF 03       	.dw	1023		;DSM disk size-1
+0135   F2A1 FF 01       	.dw	511		;DRM directory max-1
+0136   F2A3 F0          	.db	0f0h		;AL0 alloc 0
+0137   F2A4 00          	.db	0		;AL1 alloc 1
+0138   F2A5 00 00       	.dw	0		;CKS check size
+0139   F2A7 01 00       	.dw	1		;OFF track offset
+0140   F2A9             ;
+0141   F2A9             ;----------------------------------------------------------------
+0142   F2A9             ;disk parameter block for floppy disks. (720k)
+0143   F2A9             ;block size=2k (BLS), 256 dir entries (DRM), 4 blocks for directory
+0144   F2A9             ;8704 bytes reserved for system (17 disk blocks)
+0145   F2A9             ;sector 1 is reserved for boot loader
+0146   F2A9             dpblk1:
+0147   F2A9 24 00       	.dw	36		;SPT records per track
+0148   F2AB 04          	.db	4		;BSH block shift factor
+0149   F2AC 0F          	.db	15		;BLM block mask
+0150   F2AD 00          	.db	0		;EXM null mask
+0151   F2AE 5E 01       	.dw	350		;DSM disk size-1
+0152   F2B0 FF 00       	.dw	255		;DRM directory max
+0153   F2B2 F0          	.db	0f0h		;AL0 alloc 0
+0154   F2B3 00          	.db	0		;AL1 alloc 1
+0155   F2B4 40 00       	.dw	64		;CKS check size
+0156   F2B6 04 00       	.dw	4		;OFF track offset
+0157   F2B8             
+0158   F2B8             ;----------------------------------------------------------------
+0159   F2B8             ;target/lun table
+0160   F2B8             ;This table maps CP/M drive letters to target ID and LUN
+0161   F2B8             ; 2 bytes per drive
+0162   F2B8             ; 1st byte target id bit
+0163   F2B8             ; 2nd byte lun (bits 7,6,5) ored with type (0=hd 1=fd))
+0164   F2B8             ;
+0165   F2B8             tidlun:
+0166   F2B8             ;drive a:
+0167   F2B8 01          	.db	1	;tid=0
+0168   F2B9 01          	.db	1	;lun=0 type=1 (floppy)
+0169   F2BA             ;drive b:
+0170   F2BA 01          	.db	1	;tid=0
+0171   F2BB 21          	.db	$21	;lun=1 type=1 (floppy)
+0172   F2BC             ;drive c:
+0173   F2BC 02          	.db	2	;tid=1
+0174   F2BD 00          	.db	0	;lun=0 type=0 (hard)
+0175   F2BE             ;drive d:
+0176   F2BE 04          	.db	4	;tid=2
+0177   F2BF 00          	.db	0	;lun=0 type=0 (hard)
+TASM Z80 Assembler.               cbios.z80                        page 4
+CP/M Version 2.2 bios
+
+0178   F2C0             	.eject
+0179   F2C0             ;----------------------------------------------------------------
+0180   F2C0             ; Cold boot
+0181   F2C0             ; perform parameter initialization
+0182   F2C0             ;
+0183   F2C0             boot:
+0184   F2C0 AF          	xor	a		;zero in the accum
+0185   F2C1 32 03 00    	ld	(iobyte),a	;clear the iobyte
+0186   F2C4 32 D7 F5    	ld	(cur_tid),a	;mark buffer invalid
+0187   F2C7 32 F0 F5    	ld	(fl_dirty),a	;and not written
+0188   F2CA 3E 02       	ld	a,sysdsk	;select system disk
+0189   F2CC 32 04 00    	ld	(curdsk),a	;set disk
+0190   F2CF             ;
+0191   F2CF             gocpm:
+0192   F2CF 3E C3       	ld 	a, 0c3h		;c3 is a jmp instruction
+0193   F2D1 32 00 00    	ld	(0),a		;for jmp to wboot
+0194   F2D4 21 03 F2    	ld	hl, wboote	;wboot entry point
+0195   F2D7 22 01 00    	ld	(1),hl		;set address field for jmp at 0
+0196   F2DA             ;
+0197   F2DA 32 05 00    	ld	(5),a		;for jmp to bdos
+0198   F2DD 21 06 E4    	ld	hl, bdos	;bdos entry point
+0199   F2E0 22 06 00    	ld	(6),hl		;address field of jump at 5 to bdos
+0200   F2E3             ;
+0201   F2E3 01 80 00    	ld	bc, 80h		;default dma address is 80h
+0202   F2E6 CD A5 F3    	call	setdma
+0203   F2E9             ;
+0204   F2E9 3A 04 00    	ld	a,(curdsk)	;get current disk number
+0205   F2EC FE 04       	cp	disks		;see if valid disk number
+0206   F2EE DA F3 F2    	jp	c,diskok	;disk valid, go to ccp
+0207   F2F1 3E 02       	ld	a,sysdsk	;invalid disk, change to boot disk
+0208   F2F3 4F          diskok:	ld 	c, a		;send to the ccp
+0209   F2F4 C3 00 DC    	jp	ccp		;go to cp/m for further processing
+0210   F2F7             
+0211   F2F7             ;----------------------------------------------------------------
+0212   F2F7             ; Warm boot
+0213   F2F7             ; load ccp and bdos into memory
+0214   F2F7             ;
+0215   F2F7             wboot:
+0216   F2F7 31 80 00    	ld	sp, 80h		;use space below buffer for stack
+0217   F2FA 0E 02       	ld 	c, sysdsk	;select system disk
+0218   F2FC CD 50 F3    	call	seldsk		;
+0219   F2FF AF          	xor a
+0220   F300 32 D7 F5    	ld (cur_tid),a		;mark buffer invalid
+0221   F303 32 F0 F5    	ld (fl_dirty),a		;and not written
+0222   F306             ;
+0223   F306             ;setup wboot read
+0224   F306 3A ED F5    	ld a,(req_lun)		;get boot lun
+0225   F309 32 BE F5    	ld (s_wboot+1),a	;set it
+0226   F30C 3A EC F5    	ld a,(req_tid)		;get target id
+0227   F30F DD 21 C3 F5 	ld ix,s_iobt		;point to boot io table
+0228   F313 DD 77 00    	ld (ix),a		;set target id
+0229   F316             ;
+0230   F316             ;pointers all setup so do it.	
+0231   F316 CD B4 F4    	call scsi_go		;do scsi io
+0232   F319 E6 02       	and 02h			;mask to error bit
+0233   F31B CA CF F2    	jp z,gocpm		;read good so finish boot
+0234   F31E 18 D7       	jr wboot		;try again
+TASM Z80 Assembler.               cbios.z80                        page 5
+CP/M Version 2.2 bios
+
+0235   F320             	.eject
+0236   F320             ;----------------------------------------------------------------
+0237   F320             ;	simple i/o handlers for ns16550
+0238   F320             ;
+0239   F320             ;----------------------------------------------------------------
+0240   F320             ;console status, return 0ffh if character ready, 00h if not
+0241   F320             ;
+0242   F320             const:
+0243   F320 DB 85       	in 	a,(uart+5)	;get status
+0244   F322 E6 01       	and 	01h		;check rxrdy bit
+0245   F324 CA 2A F3    	jp 	z,no_char
+0246   F327 3E FF       	ld	a,0ffh		;char ready	
+0247   F329 C9          	ret
+0248   F32A             no_char:
+0249   F32A 3E 00       	ld	a,00h		;no char
+0250   F32C C9          	ret
+0251   F32D             
+0252   F32D             ;----------------------------------------------------------------
+0253   F32D             ;console character into register a
+0254   F32D             ;----------------------------------------------------------------
+0255   F32D             ;
+0256   F32D             conin:
+0257   F32D DB 85       	in 	a,(uart+5)	;get status
+0258   F32F E6 01       	and 	01h		;check rxrdy bit
+0259   F331 CA 2D F3    	jp 	z,conin		;loop until char ready
+0260   F334 DB 80       	in 	a,(uart)	;get char
+0261   F336 E6 7F       	and	7fh		;strip parity bit
+0262   F338 C9          	ret
+0263   F339             
+0264   F339             ;----------------------------------------------------------------
+0265   F339             ;console character output from register c
+0266   F339             ;----------------------------------------------------------------
+0267   F339             ;
+0268   F339             conout:
+0269   F339 DB 85       	in	a,(uart+5)
+0270   F33B E6 20       	and	20h		;check txrdy bit
+0271   F33D CA 39 F3    	jp	z,conout	;loop until port ready
+0272   F340 79          	ld	a,c		;get the char
+0273   F341 D3 80       	out	(uart),a	;out to port
+0274   F343 C9          	ret
+0275   F344             
+0276   F344             ;----------------------------------------------------------------
+0277   F344             ;list character from register c
+0278   F344             ;(stub)
+0279   F344             ;----------------------------------------------------------------
+0280   F344             ;
+0281   F344             list:
+0282   F344 79          	ld 	a, c	  	;character to register a
+0283   F345 C9          	ret		  	;null subroutine
+0284   F346             
+0285   F346             ;----------------------------------------------------------------
+0286   F346             ;return list status (0 if not ready, 1 if ready)
+0287   F346             ;(stub)
+0288   F346             ;----------------------------------------------------------------
+0289   F346             ;
+0290   F346             listst:
+0291   F346 AF          	xor	a	 	;0 is always ok to return
+0292   F347 C9          	ret
+0293   F348             
+TASM Z80 Assembler.               cbios.z80                        page 6
+CP/M Version 2.2 bios
+
+0294   F348             ;----------------------------------------------------------------
+0295   F348             ;punch	character from	register c
+0296   F348             ;(stub)
+0297   F348             ;----------------------------------------------------------------
+0298   F348             ;
+0299   F348             punch:
+0300   F348 79          	ld 	a, c		;character to register a
+0301   F349 C9          	ret			;null subroutine
+0302   F34A             
+0303   F34A             ;----------------------------------------------------------------
+0304   F34A             ;reader character into register a from reader device
+0305   F34A             ;(stub)
+0306   F34A             ;----------------------------------------------------------------
+0307   F34A             ;
+0308   F34A             reader:
+0309   F34A 3E 1A       	ld     a, 1ah		;return end of file (stub routine)
+0310   F34C E6 7F       	and    7fh		;strip parity bit
+0311   F34E C9          	ret
+TASM Z80 Assembler.               cbios.z80                        page 7
+CP/M Version 2.2 bios
+
+0312   F34F             	.eject
+0313   F34F             ;----------------------------------------------------------------
+0314   F34F             ;	i/o drivers for the disk 
+0315   F34F             ; Drivers include sector blocking/deblocking
+0316   F34F             ; CP/M records (128B) are grouped 4 to a disk block (512B)
+0317   F34F             ; the low 2 bits of the CP/M sector number select the data
+0318   F34F             ; position in the disk buffer
+0319   F34F             ;----------------------------------------------------------------
+0320   F34F             ;
+0321   F34F             ;----------------------------------------------------------------
+0322   F34F             ; move to track 00
+0323   F34F             ;----------------------------------------------------------------
+0324   F34F             ;
+0325   F34F             home:
+0326   F34F C9          	ret			;not used
+0327   F350             
+0328   F350             ;----------------------------------------------------------------
+0329   F350             ; select disk given by register c
+0330   F350             ; set requested TID,LUN and dsk_typ
+0331   F350             ; return parameter header in HL
+0332   F350             ;----------------------------------------------------------------
+0333   F350             ;
+0334   F350             seldsk:
+0335   F350 21 00 00    	ld	hl, 0000h	;error return code
+0336   F353 11 B8 F2    	ld	de,tidlun	;point to tid table
+0337   F356 79          	ld 	a, c
+0338   F357 32 EB F5    	ld	(diskno),a	;set disk number
+0339   F35A FE 04       	cp	disks		;must be between 0 and 3
+0340   F35C D0          	ret	nc		;return if bad drive num
+0341   F35D             ;
+0342   F35D             ; disk number is in the proper range
+0343   F35D             ; setup target id and lun
+0344   F35D 3A EB F5    	ld	a,(diskno)	;get disk number
+0345   F360 6F          	ld 	l, a		;into hl
+0346   F361 26 00       	ld 	h, 0		;high order zero
+0347   F363 29          	add	hl,hl		;*2
+0348   F364 19          	add	hl,de		;make table index
+0349   F365 7E          	ld	a,(hl)		;get target id
+0350   F366 32 EC F5    	ld	(req_tid),a	;set requested target id
+0351   F369 23          	inc 	hl
+0352   F36A 7E          	ld	a,(hl)		;get target lun
+0353   F36B E6 E0       	and	$e0		;mask to lun bits
+0354   F36D 32 ED F5    	ld	(req_lun),a	;set lun
+0355   F370 7E          	ld	a,(hl)		;get drive type
+0356   F371 E6 01       	and	1		;mask to type bit
+0357   F373 32 F3 F5    	ld	(dsk_typ),a	;set disk type	
+0358   F376             ;
+0359   F376             ; compute proper disk parameter entry address
+0360   F376             ; mult disk num by size of table entry (16Bytes)
+0361   F376             ; add to base of table
+0362   F376 3A EB F5    	ld	a,(diskno)
+0363   F379 6F          	ld 	l, a		;l=disk number 0, 1, 2, 3
+0364   F37A 26 00       	ld 	h, 0		;high order zero
+0365   F37C 29          	add	hl,hl		;*2
+0366   F37D 29          	add	hl,hl		;*4
+0367   F37E 29          	add	hl,hl		;*8
+0368   F37F 29          	add	hl,hl		;*16 (size of each table)
+0369   F380 11 36 F2    	ld	de, dpbase
+0370   F383 19          	add	hl,de		;hl=dpbase+(diskno*16)
+TASM Z80 Assembler.               cbios.z80                        page 8
+CP/M Version 2.2 bios
+
+0371   F384 C9          	ret
+0372   F385             
+0373   F385             ;----------------------------------------------------------------
+0374   F385             ;set track given by register bc
+0375   F385             ;----------------------------------------------------------------
+0376   F385             ;
+0377   F385             settrk:
+0378   F385 ED 43 E5 F5 	ld	(track),bc
+0379   F389 C9          	ret
+0380   F38A             
+0381   F38A             ;----------------------------------------------------------------
+0382   F38A             ;set sector given by register bc
+0383   F38A             ;----------------------------------------------------------------
+0384   F38A             ;
+0385   F38A             setsec:
+0386   F38A ED 43 E7 F5 	ld	(sector),bc
+0387   F38E C9          	ret
+TASM Z80 Assembler.               cbios.z80                        page 9
+CP/M Version 2.2 bios
+
+0388   F38F             	.eject
+0389   F38F             ;----------------------------------------------------------------
+0390   F38F             ; sector translate
+0391   F38F             ;
+0392   F38F             ;set record based on low 2 bits of sector number
+0393   F38F             ;bits 0-1 of sector are where this record is in disk buffer
+0394   F38F             ;
+0395   F38F             ;translate the sector given by bc using the
+0396   F38F             ;translate table given by de
+0397   F38F             ;
+0398   F38F             ;no translation is done for hard disk
+0399   F38F             ;translated sector number in hl
+0400   F38F             ;----------------------------------------------------------------
+0401   F38F             ;
+0402   F38F             sectran:
+0403   F38F 79          	ld	a,c		;save record bits
+0404   F390 E6 03       	and	3		;mask to record bits
+0405   F392 32 F1 F5    	ld	(record),a	;save it
+0406   F395 3A F3 F5    	ld	a,(dsk_typ)	;get disk type
+0407   F398 E6 01       	and	1		;mask to type bit
+0408   F39A 28 06       	jr	z,hsectrn	;jmp if hard disk
+0409   F39C             ;
+0410   F39C             ;floppy sectran routine (use trans table)
+0411   F39C EB          	ex	de,hl		;table ptr into hl
+0412   F39D 09          	add	hl,bc		;add sector num
+0413   F39E 6E          	ld 	l, (hl)		;get translated into hl
+0414   F39F 26 00       	ld 	h, 0		;h is always 0
+0415   F3A1 C9          	ret			;with value in hl
+0416   F3A2             ;
+0417   F3A2             ;hard disk sectran routine (no translation)
+0418   F3A2             hsectrn:
+0419   F3A2 C5          	push bc
+0420   F3A3 E1          	pop hl			;get sector
+0421   F3A4 C9          	ret
+0422   F3A5             
+0423   F3A5             ;----------------------------------------------------------------
+0424   F3A5             ;set dma address given by register bc
+0425   F3A5             ;----------------------------------------------------------------
+0426   F3A5             ;
+0427   F3A5             setdma:
+0428   F3A5 ED 43 E9 F5 	ld	(dmaad),bc	;save the address
+0429   F3A9 C9          	ret
+TASM Z80 Assembler.               cbios.z80                        page 10
+CP/M Version 2.2 bios
+
+0430   F3AA             	.eject
+0431   F3AA             ;----------------------------------------------------------------
+0432   F3AA             ;read one cp/m record (128 bytes) from disk buffer.
+0433   F3AA             ;calls flush to write current disk block (if dirty) and
+0434   F3AA             ; read requested disk block into buffer
+0435   F3AA             ;copy record to user space
+0436   F3AA             ;return 0h in register A if the operation completes properly
+0437   F3AA             ;and 1h if an error occurs during the read.
+0438   F3AA             ;----------------------------------------------------------------
+0439   F3AA             ;
+0440   F3AA             rd_rec:
+0441   F3AA CD E7 F3    	call flush	;write (if necessary) and read new block
+0442   F3AD C0          	ret nz		;error?
+0443   F3AE CD A5 F4    	call mk_ptr	;point to disk data area in hl
+0444   F3B1 ED 5B E9 F5 	ld de,(dmaad)	;destination pointer
+0445   F3B5 01 80 00    	ld bc,128	;byte count
+0446   F3B8 ED B0       	ldir		;block move data to user
+0447   F3BA AF          	xor a		;update condition code
+0448   F3BB C9          	ret
+0449   F3BC             
+0450   F3BC             ;----------------------------------------------------------------
+0451   F3BC             ;write one cp/m record (128 bytes) to disk buffer.
+0452   F3BC             ;calls flush to write current disk block (if dirty)
+0453   F3BC             ;and pre read requested disk block into buffer
+0454   F3BC             ;moves record to buffer and set dirty flag
+0455   F3BC             ;then write to disk if wr_type=1 (directory record)
+0456   F3BC             ;return  0h in register a if the operation completes properly
+0457   F3BC             ;and 1h if an error occurs during the fush,preread or write
+0458   F3BC             ;----------------------------------------------------------------
+0459   F3BC             ;
+0460   F3BC             wr_rec:
+0461   F3BC 79          	ld a,c		;
+0462   F3BD 32 F4 F5    	ld (wr_type),a	;save write type
+0463   F3C0             ;
+0464   F3C0             ;write buffer if needed
+0465   F3C0 CD E7 F3    	call flush	;write buffer and pre-read if necessary
+0466   F3C3 C0          	ret nz		;exit if error
+0467   F3C4             ;
+0468   F3C4             ;move record to buffer
+0469   F3C4 CD A5 F4    	call mk_ptr	;point to record in disk buffer
+0470   F3C7 EB          	ex de,hl	;dest pointer to de
+0471   F3C8 2A E9 F5    	ld hl,(dmaad)	;source pointer
+0472   F3CB 01 80 00    	ld bc,128	;count
+0473   F3CE ED B0       	ldir		;move user data to buffer
+0474   F3D0 3E FF       	ld a,$ff	;set dirty flag
+0475   F3D2 32 F0 F5    	ld (fl_dirty),a
+0476   F3D5             ;
+0477   F3D5             ;write buffer now if wr_type=1
+0478   F3D5 3A F4 F5    	ld a,(wr_type)	;get write type
+0479   F3D8 E6 01       	and 1
+0480   F3DA 28 0A       	jr z,not_imm	;dont write now?
+0481   F3DC CD 43 F4    	call wr_phy
+0482   F3DF 3E 01       	ld a,1		;preset error return code
+0483   F3E1 C0          	ret nz		;exit if error
+0484   F3E2 AF          	xor a		;no error return code
+0485   F3E3 32 F0 F5    	ld (fl_dirty),a	;clear dirty flag
+0486   F3E6             not_imm:
+0487   F3E6 C9          	ret
+TASM Z80 Assembler.               cbios.z80                        page 11
+CP/M Version 2.2 bios
+
+0488   F3E7             	.eject
+0489   F3E7             ;----------------------------------------------------------------
+0490   F3E7             ;Update sector buffer
+0491   F3E7             ;if buffer = requested do nothing
+0492   F3E7             ;else if dirty write to disk
+0493   F3E7             ;read requested block into buffer
+0494   F3E7             ;----------------------------------------------------------------
+0495   F3E7             ;
+0496   F3E7             flush:
+0497   F3E7 CD 56 F4    	call ts2lbn		;convert track/sector to lbn
+0498   F3EA             ;
+0499   F3EA             ;see if requested is already in disk buffer
+0500   F3EA             ;nothing to do if it matches
+0501   F3EA 21 EC F5    	ld hl,req_tid
+0502   F3ED 3A D7 F5    	ld a,(cur_tid)		;check target id
+0503   F3F0 BE          	cp (hl)
+0504   F3F1 20 17       	jr nz,notcur		;not currently in buffer
+0505   F3F3             ;
+0506   F3F3 23          	inc hl
+0507   F3F4 3A D2 F5    	ld a,(cur_lun)		;check lun
+0508   F3F7 BE          	cp (hl)
+0509   F3F8 20 10       	jr nz,notcur		;not currently in buffer
+0510   F3FA             ;
+0511   F3FA 23          	inc hl
+0512   F3FB 3A D3 F5    	ld a,(cur_lbn)		;check block number (hi)
+0513   F3FE BE          	cp (hl)
+0514   F3FF 20 09       	jr nz,notcur		;not currently in buffer
+0515   F401             ;
+0516   F401 23          	inc hl
+0517   F402 3A D4 F5    	ld a,(cur_lbn+1)	;check block number (low)
+0518   F405 BE          	cp (hl)
+0519   F406 20 02       	jr nz,notcur		;not currently in buffer
+0520   F408             ;
+0521   F408             ;everything matched so record is currently in buffer
+0522   F408             ;no write or preread required
+0523   F408 AF          	xor a			;success
+0524   F409 C9          	ret			;exit
+0525   F40A             ;
+0526   F40A             ;requested record is not in buffer
+0527   F40A             notcur:
+0528   F40A             ;
+0529   F40A             ;is the current buffer valid?
+0530   F40A 3A D7 F5    	ld a,(cur_tid)		;get TID
+0531   F40D B7          	or a			;zero is not valid
+0532   F40E 28 0C       	jr z,setreq		;read if nothing in buf
+0533   F410             ;
+0534   F410             ;has the buffer been written? (dirty)
+0535   F410 3A F0 F5    	ld a,(fl_dirty)		;buffer written?
+0536   F413 B7          	or a			;if buffer not written
+0537   F414 28 06       	jr z,setreq		;read if not dirty
+0538   F416             ;
+0539   F416             ;write the changed buffer to disk
+0540   F416 CD 43 F4    	call wr_phy		;write block to disk
+0541   F419 3E 01       	ld a,01			;preset error code
+0542   F41B C0          	ret nz			;error? then exit
+0543   F41C             ;
+0544   F41C             ;setup parameters for requested sector
+0545   F41C             setreq:
+0546   F41C 3A EC F5    	ld a,(req_tid)		;change to requested
+TASM Z80 Assembler.               cbios.z80                        page 12
+CP/M Version 2.2 bios
+
+0547   F41F 32 D7 F5    	ld (cur_tid),a		;target
+0548   F422 3A ED F5    	ld a,(req_lun)
+0549   F425 32 D2 F5    	ld (cur_lun),a		;LUN LBN hi
+0550   F428 3A EE F5    	ld a,(req_lbn)
+0551   F42B 32 D3 F5    	ld (cur_lbn),a		;LBN mid
+0552   F42E 3A EF F5    	ld a,(req_lbn+1)
+0553   F431 32 D4 F5    	ld (cur_lbn+1),a	;LBN low
+0554   F434             ;
+0555   F434             ;pre-read requested sector
+0556   F434 CD 47 F4    	call rd_phy		;read block from disk
+0557   F437 3E 00       	ld a,0			;preset return value
+0558   F439 32 F0 F5    	ld (fl_dirty),a		;clear buffer written
+0559   F43C C8          	ret z			;Z=success
+0560   F43D             ;
+0561   F43D             ;read failed so invalidate buffer
+0562   F43D 32 D7 F5    	ld (cur_tid),a		;invalidate buffer
+0563   F440 3E 01       	ld a,1			;error response
+0564   F442 C9          	ret			;NZ=error
+TASM Z80 Assembler.               cbios.z80                        page 13
+CP/M Version 2.2 bios
+
+0565   F443             	.eject
+0566   F443             ;----------------------------------------------------------------
+0567   F443             ;write logical block to disk
+0568   F443             ;cur_tid,cur_lun,cur_lbn already set
+0569   F443             ;exit with zero status if ok
+0570   F443             ;----------------------------------------------------------------
+0571   F443             ;
+0572   F443             wr_phy:
+0573   F443 3E 0A       	ld a,0ah		;write command
+0574   F445 18 02       	jr phy_com		;finish same as read
+0575   F447             
+0576   F447             ;----------------------------------------------------------------
+0577   F447             ;read logical block from disk
+0578   F447             ;cur_tid,cur_lun,cur_lbn already set
+0579   F447             ;exit with zero status if ok
+0580   F447             ;----------------------------------------------------------------
+0581   F447             ;
+0582   F447             rd_phy:
+0583   F447 3E 08       	ld a,8			;read command
+0584   F449             phy_com:
+0585   F449 32 D1 F5    	ld (s_cdb),a		;set in command block
+0586   F44C DD 21 D7 F5 	ld ix,s_iot		;point to io table
+0587   F450 CD B4 F4    	call scsi_go
+0588   F453 E6 02       	and 02h			;mask to error bit
+0589   F455 C9          	ret
+0590   F456             
+0591   F456             ;----------------------------------------------------------------
+0592   F456             ;convert track/sector to LBN (logical block number)
+0593   F456             ;req_lun,dsk_typ,track,sector set on entry
+0594   F456             ;req_lun,req_lbn updated on exit
+0595   F456             ;----------------------------------------------------------------
+0596   F456             ;
+0597   F456             ts2lbn:
+0598   F456 3A F3 F5    	ld a,(dsk_typ)		;branch on disk type
+0599   F459 E6 01       	and 1			;mask to FD bit
+0600   F45B 28 1B       	jr z,hconv		;goto hard disk
+0601   F45D             
+0602   F45D             ;
+0603   F45D             ;----------------------------------------------------------------
+0604   F45D             ;floppy disk LBN conversion
+0605   F45D             ;divide requested record by 4 (4 cp/m records per sector) 
+0606   F45D             ;mult track by 9 and add sector/4=lbn
+0607   F45D             ;
+0608   F45D             fconv:
+0609   F45D 3A E7 F5    	ld a,(sector)		;get desired sector
+0610   F460 3D          	dec a			;make sector zero based
+0611   F461 CB 3F       	srl a			;divide by 4
+0612   F463 CB 3F       	srl a
+0613   F465 4F          	ld c,a			;save result in bc
+0614   F466 06 00       	ld b,0
+0615   F468             ;
+0616   F468             ;multiply track by 9 (phy sectors per track)
+0617   F468 2A E5 F5    	ld hl,(track)		;get track in hl
+0618   F46B E5          	push hl
+0619   F46C D1          	pop de			;get track in de
+0620   F46D 29          	add hl,hl		;times 2
+0621   F46E 29          	add hl,hl		;times 4
+0622   F46F 29          	add hl,hl		;times 8
+0623   F470 19          	add hl,de		;plus de=times 9
+TASM Z80 Assembler.               cbios.z80                        page 14
+CP/M Version 2.2 bios
+
+0624   F471 09          	add hl,bc		;plus sector=lbn
+0625   F472             ;
+0626   F472 06 00       	ld b,0			;B=LBA hi=0
+0627   F474 4C          	ld c,h			;H into LBA mid
+0628   F475 5D          	ld e,l			;L into LBA low
+0629   F476 18 1B       	jr set_req
+0630   F478             ;
+0631   F478             ;----------------------------------------------------------------
+0632   F478             ;hard disk conversion
+0633   F478             hconv:
+0634   F478 3A E7 F5    	ld a,(sector)
+0635   F47B 17          	rla			;line up sector to msb
+0636   F47C 5F          	ld e,a			;save it
+0637   F47D ED 4B E5 F5 	ld bc,(track)		;get requested track
+0638   F481             ;
+0639   F481             ;shift bc,e right 3 places (track/sector)
+0640   F481             ;or in the lun bits into b
+0641   F481             ;this will divide sector by 4
+0642   F481             ;filling hi bits with track bits
+0643   F481             ;resulting LBN= lllt tttt  tttt tttt  ttts ssss
+0644   F481             ;              |    B    ||    C    ||    E    |
+0645   F481 CB 38       	srl b
+0646   F483 CB 19       	rr c
+0647   F485 CB 1B       	rr e
+0648   F487 CB 38       	srl b
+0649   F489 CB 19       	rr c
+0650   F48B CB 1B       	rr e
+0651   F48D CB 38       	srl b
+0652   F48F CB 19       	rr c
+0653   F491 CB 1B       	rr e
+0654   F493             ;
+0655   F493             ;----------------------------------------------------------------
+0656   F493             ;set req_lun,req_lbn with values in B,C,E
+0657   F493             ;
+0658   F493             set_req:
+0659   F493             ;
+0660   F493             ;or LUN bits into LBA hi
+0661   F493 3A ED F5    	ld a,(req_lun)		;get LUN bits
+0662   F496 E6 E0       	and 0e0h		;mask to lun bits
+0663   F498 B0          	or b			;set high addr
+0664   F499             ;
+0665   F499             ;put LUN/LBA in requested
+0666   F499 32 ED F5    	ld (req_lun),a		;set lba hi and lun
+0667   F49C 79          	ld a,c			;get mid
+0668   F49D 32 EE F5    	ld (req_lbn),a		;save lba mid
+0669   F4A0 7B          	ld a,e			;get low
+0670   F4A1 32 EF F5    	ld (req_lbn+1),a	;save lba low
+0671   F4A4 C9          	ret
+TASM Z80 Assembler.               cbios.z80                        page 15
+CP/M Version 2.2 bios
+
+0672   F4A5             	.eject
+0673   F4A5             ;----------------------------------------------------------------
+0674   F4A5             ;make pointer to cp/m record in disk buffer
+0675   F4A5             ;----------------------------------------------------------------
+0676   F4A5             ;
+0677   F4A5             mk_ptr:
+0678   F4A5 11 80 00    	ld de,128		;size of record
+0679   F4A8 21 79 F8    	ld hl,dskbuf-128	;point to buffer-128
+0680   F4AB 3A F1 F5    	ld a,(record)		;(0-3)
+0681   F4AE 3C          	inc a			;always do loop once
+0682   F4AF             ptr_loop:
+0683   F4AF 19          	add hl,de		;advance to next record
+0684   F4B0 3D          	dec a
+0685   F4B1 20 FC       	jr nz,ptr_loop		;loop till proper record
+0686   F4B3 C9          	ret			;return pointer in hl
+TASM Z80 Assembler.               cbios.z80                        page 16
+CP/M Version 2.2 bios
+
+0687   F4B4             	.eject
+0688   F4B4             ;-------------------------------------------------------------------------------
+0689   F4B4             ;do scsi transaction
+0690   F4B4             ; ix=scsi io block
+0691   F4B4             ;-------------------------------------------------------------------------------
+0692   F4B4             scsi_go:
+0693   F4B4 3E FF       	ld a,$ff	;preset error status
+0694   F4B6 DD 6E 04    	ld l,(ix+4)	;point to status address
+0695   F4B9 DD 66 05    	ld h,(ix+5)	;point to status address
+0696   F4BC 77          	ld (hl),a	;set error
+0697   F4BD             ;
+0698   F4BD AF          	xor a		;
+0699   F4BE D3 8A       	out (sr_mr),a	;reset control reg
+0700   F4C0 D3 8B       	out (sr_tcr),a	;clear command reg.
+0701   F4C2 D3 89       	out (sr_icr),a	;
+0702   F4C4 DD 7E 00    	ld a,(ix)	;get tid
+0703   F4C7 D3 88       	out (sr_odr),a	;set target id
+0704   F4C9 3E 01       	ld a,$01	;drive bus
+0705   F4CB D3 89       	out (sr_icr),a	;
+0706   F4CD 3E 05       	ld a,$05	;set sel and drive bus
+0707   F4CF D3 89       	out (sr_icr),a	;
+0708   F4D1             ;
+0709   F4D1             ;wait for scsi busy
+0710   F4D1 01 00 00    	ld bc,0		;init timeout
+0711   F4D4             s_swt:
+0712   F4D4 DB 8C       	in a,(sr_csbs)	;get bus status
+0713   F4D6 E6 40       	and sm_bsy	;mask to busy bit
+0714   F4D8 20 0E       	jr nz,s_bsya	;jmp if busy active
+0715   F4DA 00          	nop		;kill a little time
+0716   F4DB 00          	nop
+0717   F4DC 00          	nop
+0718   F4DD 00          	nop
+0719   F4DE 0B          	dec bc		;dec timeout
+0720   F4DF 78          	ld a,b		;test timeout=0
+0721   F4E0 B1          	or c
+0722   F4E1 20 F1       	jr nz,s_swt	;jmp if no timeout
+0723   F4E3 AF          	xor a		;clear a
+0724   F4E4 D3 89       	out (sr_icr),a	;clear sel and data
+0725   F4E6 18 0D       	jr s_exit	;error exit
+0726   F4E8             ;
+0727   F4E8             ;busy is active
+0728   F4E8             s_bsya:
+0729   F4E8 AF          	xor a		;clear a
+0730   F4E9 D3 89       	out (sr_icr),a	;clear sel and data
+0731   F4EB             
+0732   F4EB             ;-------------------------------------------------------------------------------
+0733   F4EB             ;
+0734   F4EB             ;target is selected so test bsy and req
+0735   F4EB             ;then decode requested phase
+0736   F4EB             ;
+0737   F4EB             ;-------------------------------------------------------------------------------
+0738   F4EB             phase:
+0739   F4EB AF          	xor a
+0740   F4EC D3 89       	out (sr_icr),a	;reset initiator
+0741   F4EE             ;
+0742   F4EE             s_wtreq:
+0743   F4EE DB 8C       	in a,(sr_csbs)	;get bus status
+0744   F4F0 47          	ld b,a		;save copy
+0745   F4F1 E6 40       	and sm_bsy	;mask to busy bit
+TASM Z80 Assembler.               cbios.z80                        page 17
+CP/M Version 2.2 bios
+
+0746   F4F3 20 08       	jr nz,s_wtrq1	;still busy so cont.
+0747   F4F5             
+0748   F4F5             ;-------------------------------------------------------------------------------
+0749   F4F5             ;busy lost so exit
+0750   F4F5             ;-------------------------------------------------------------------------------
+0751   F4F5             s_exit:
+0752   F4F5 DD 6E 04    	ld l,(ix+4)	;get status pointer
+0753   F4F8 DD 66 05    	ld h,(ix+5)	;get status pointer
+0754   F4FB 7E          	ld a,(hl)
+0755   F4FC C9          	ret		;busy lost? were done
+0756   F4FD             ;
+0757   F4FD             s_wtrq1:
+0758   F4FD 78          	ld a,b		;recover status
+0759   F4FE E6 20       	and sm_req	;request active?
+0760   F500 28 EC       	jr z,s_wtreq	;loop till request
+0761   F502             
+0762   F502             ;-------------------------------------------------------------------------------
+0763   F502             ;request is active so set 5380 to requested phase
+0764   F502             ;-------------------------------------------------------------------------------
+0765   F502 78          	ld a,b		;recover bus status
+0766   F503 CB 1F       	rr a		;shift status to phase bits
+0767   F505 CB 1F       	rr a
+0768   F507 E6 07       	and $07		;mask to phase bits
+0769   F509 D3 8B       	out (sr_tcr),a	;set phase
+0770   F50B             ;
+0771   F50B             ;jump to phase handler
+0772   F50B             ;
+0773   F50B 78          	ld a,b		;recover bus status 
+0774   F50C CB 1F       	rr a
+0775   F50E E6 0E       	and $0e		;mask to phase bits
+0776   F510 5F          	ld e,a		;
+0777   F511 16 00       	ld d,0
+0778   F513 21 1C F5    	ld hl,phtabl	;point to table
+0779   F516 19          	add hl,de	;offset into table
+0780   F517 5E          	ld e,(hl)	;get execution address
+0781   F518 23          	inc hl
+0782   F519 56          	ld d,(hl)
+0783   F51A D5          	push de
+0784   F51B C9          	ret		;execute phase
+0785   F51C             
+0786   F51C             ;-------------------------------------------------------------------------------
+0787   F51C             ;phase table
+0788   F51C             ;-------------------------------------------------------------------------------
+0789   F51C             phtabl:
+0790   F51C 2C F5       	.word	phase0	;data out
+0791   F51E 35 F5       	.word	phase1	;data in
+0792   F520 3E F5       	.word	phase2	;cmd out
+0793   F522 47 F5       	.word	phase3	;status in
+0794   F524 F5 F4       	.word	s_exit	;unused
+0795   F526 F5 F4       	.word	s_exit	;unused
+0796   F528 50 F5       	.word	phase6	;message out
+0797   F52A 59 F5       	.word	phase7	;message in
+0798   F52C             
+0799   F52C             ;-------------------------------------------------------------------------------
+0800   F52C             ;phase handlers
+0801   F52C             ;-------------------------------------------------------------------------------
+0802   F52C             ;
+0803   F52C             ;data out
+0804   F52C             phase0:
+TASM Z80 Assembler.               cbios.z80                        page 18
+CP/M Version 2.2 bios
+
+0805   F52C DD 6E 06    	ld l,(ix+6)	;get pointer
+0806   F52F DD 66 07    	ld h,(ix+7)
+0807   F532 C3 62 F5    	jp s_writ	;write bytes
+0808   F535             ;
+0809   F535             ;data in
+0810   F535             phase1:
+0811   F535 DD 6E 08    	ld l,(ix+8)	;get pointer
+0812   F538 DD 66 09    	ld h,(ix+9)
+0813   F53B C3 92 F5    	jp s_read	;read bytes
+0814   F53E             ;
+0815   F53E             ;cmd out
+0816   F53E             phase2:
+0817   F53E DD 6E 02    	ld l,(ix+2)
+0818   F541 DD 66 03    	ld h,(ix+3)
+0819   F544 C3 62 F5    	jp s_writ
+0820   F547             ;
+0821   F547             ;status in
+0822   F547             phase3:
+0823   F547 DD 6E 04    	ld l,(ix+4)
+0824   F54A DD 66 05    	ld h,(ix+5)
+0825   F54D C3 92 F5    	jp s_read
+0826   F550             ;
+0827   F550             ;msg out
+0828   F550             phase6:
+0829   F550 DD 6E 0A    	ld l,(ix+10)
+0830   F553 DD 66 0B    	ld h,(ix+11)
+0831   F556 C3 62 F5    	jp s_writ
+0832   F559             ;
+0833   F559             ;msg in
+0834   F559             phase7:
+0835   F559 DD 6E 0C    	ld l,(ix+12)
+0836   F55C DD 66 0D    	ld h,(ix+13)
+0837   F55F C3 92 F5    	jp s_read
+TASM Z80 Assembler.               cbios.z80                        page 19
+CP/M Version 2.2 bios
+
+0838   F562             	.eject
+0839   F562             ;-------------------------------------------------------------------------------
+0840   F562             ;scsi write routine (send bytes to target)
+0841   F562             ;bus phase already set. return on phase mismatch 
+0842   F562             ;-------------------------------------------------------------------------------
+0843   F562             s_writ:
+0844   F562 3E 01       	ld a,1		;drive scsi data bus
+0845   F564 D3 89       	out (sr_icr),a
+0846   F566             ;
+0847   F566             ;wait for req while checking busy
+0848   F566             ;
+0849   F566             s_wwreq:
+0850   F566 DB 8C               in a,(sr_csbs)  ;get current bus stat
+0851   F568 47                  ld b,a          ;save it
+0852   F569 E6 20               and sm_req      ;request active?
+0853   F56B 20 09               jr nz,s_wnxt    ;
+0854   F56D             ;
+0855   F56D 78                  ld a,b          ;recover current bus stat
+0856   F56E E6 40               and sm_bsy      ;still busy?
+0857   F570 C2 66 F5            jp nz,s_wwreq   ;loop if still busy
+0858   F573 C3 EB F4            jp phase        ;
+0859   F576             ;
+0860   F576             ;request active so check phase
+0861   F576             ;
+0862   F576             s_wnxt:
+0863   F576 DB 8D               in a,(sr_bsr)   ;get status
+0864   F578 E6 08               and sm_phm      ;mask to phase match
+0865   F57A CA EB F4            jp z,phase      ;jmp if phase mismatch
+0866   F57D             ;
+0867   F57D             ;request active and phase match so send data
+0868   F57D             ;
+0869   F57D 7E          	ld a,(hl)	;get byte
+0870   F57E D3 88       	out (sr_odr),a	;send data
+0871   F580 3E 11       	ld a,$11	;ack + drive bus
+0872   F582 D3 89       	out (sr_icr),a	;set ack,drive scsi bus
+0873   F584 23          	inc hl		;advance buf pointer
+0874   F585             ;
+0875   F585             ;wait for request to drop
+0876   F585             ;
+0877   F585             s_wnreq:
+0878   F585 DB 8C       	in a,(sr_csbs)	;get current status
+0879   F587 E6 20       	and sm_req
+0880   F589 20 FA       	jr nz,s_wnreq	;loop till req drops
+0881   F58B             ;
+0882   F58B 3E 01       	ld a,$1		;drop ack,assert data
+0883   F58D D3 89       	out (sr_icr),a	;drop ack
+0884   F58F C3 66 F5    	jp s_wwreq	;loop for next byte/phase
+TASM Z80 Assembler.               cbios.z80                        page 20
+CP/M Version 2.2 bios
+
+0885   F592             	.eject
+0886   F592             ;-------------------------------------------------------------------------------
+0887   F592             ;scsi read routine (get bytes from target)
+0888   F592             ;bus phase already set. return on phase mismatch 
+0889   F592             ;-------------------------------------------------------------------------------
+0890   F592             ;
+0891   F592             s_read:
+0892   F592             ;
+0893   F592             ;wait for req while checking busy
+0894   F592             ;
+0895   F592             s_rwreq:
+0896   F592 DB 8C               in a,(sr_csbs)  ;get current bus stat
+0897   F594 47                  ld b,a          ;save it
+0898   F595 E6 20               and sm_req      ;request active?
+0899   F597 20 09               jr nz,s_rnxt    ;
+0900   F599             ;
+0901   F599 78                  ld a,b          ;recover current bus stat
+0902   F59A E6 40               and sm_bsy      ;still busy?
+0903   F59C C2 92 F5            jp nz,s_rwreq   ;loop if stil busy
+0904   F59F C3 EB F4            jp phase        ;
+0905   F5A2             ;
+0906   F5A2             ;request active so check phase
+0907   F5A2             s_rnxt:
+0908   F5A2 DB 8D               in a,(sr_bsr)   ;get status
+0909   F5A4 E6 08               and sm_phm      ;mask to phase match
+0910   F5A6 CA EB F4            jp z,phase      ;jmp if phase mismatch
+0911   F5A9             
+0912   F5A9             ;request active and phase match so get data
+0913   F5A9             ;
+0914   F5A9 DB 88       	in a, (sr_csd)	;get data
+0915   F5AB 77          	ld (hl),a	;save data
+0916   F5AC 3E 10       	ld a,$10
+0917   F5AE D3 89       	out (sr_icr),a	;set ack
+0918   F5B0 23          	inc hl		;advance buf pointer
+0919   F5B1             ;
+0920   F5B1             ;wait for request to drop
+0921   F5B1             ;
+0922   F5B1             s_rnreq:
+0923   F5B1 DB 8C       	in a,(sr_csbs)	;get current status
+0924   F5B3 E6 20       	and sm_req
+0925   F5B5 20 FA       	jr nz,s_rnreq	;loop till req drops
+0926   F5B7 AF          	xor a
+0927   F5B8 D3 89       	out (sr_icr),a	;drop ack
+0928   F5BA C3 92 F5    	jp s_read	;loop for next byte/phase
+0929   F5BD             
+TASM Z80 Assembler.               cbios.z80                        page 21
+CP/M Version 2.2 bios
+
+0930   F5BD             	.eject
+0931   F5BD             ;----------------------------------------------------------------
+0932   F5BD             ; initialized data area
+0933   F5BD             ;----------------------------------------------------------------
+0934   F5BD             ;scsi command descriptor for wboot
+0935   F5BD             ;read "nsects" (512 byte) blocks starting at lbn 1
+0936   F5BD             ;and put at "ccp"
+0937   F5BD             ;
+0938   F5BD             s_wboot:
+0939   F5BD 08          		.db	8	;command (read)
+0940   F5BE 00          		.db	0	;lun/lbn hi
+0941   F5BF 00          		.db	0	;lbn mid
+0942   F5C0 01          		.db	1	;lbn low
+0943   F5C1 0B          		.db	nsects	;count
+0944   F5C2 00          		.db	0	;flags
+0945   F5C3             ;
+0946   F5C3             ;----------------------------------------------------------------
+0947   F5C3             ;scsi i/o address table for wboot
+0948   F5C3             s_iobt:
+0949   F5C3 00          		.db	0	;target ID (filled in by wboot)
+0950   F5C4 00          		.db	0	;unused
+0951   F5C5 BD F5       		.dw	s_wboot	;cdb pointer
+0952   F5C7 F5 F5       		.dw	s_stat	;status pointer
+0953   F5C9 00 DC       		.dw	ccp	;data out pointer
+0954   F5CB 00 DC       		.dw	ccp	;data in pointer
+0955   F5CD F7 F5       		.dw	s_msg	;msg out pointer
+0956   F5CF F7 F5       		.dw	s_msg	;msg in pointer
+0957   F5D1             
+0958   F5D1             ;----------------------------------------------------------------
+0959   F5D1             ;scsi command descriptor for read/write
+0960   F5D1             ;do not use this for direct scsi i/o
+0961   F5D1             ;you will mess up block/deblock
+0962   F5D1             s_cdb:	
+0963   F5D1 08          		.db	8	;command
+0964   F5D2             cur_lun:
+0965   F5D2 00          		.db	0	;lun/lba hi
+0966   F5D3             cur_lbn:
+0967   F5D3 00          		.db	0	;lba mid
+0968   F5D4 00          		.db	0	;lba low
+0969   F5D5 01          		.db	1	;count
+0970   F5D6 00          		.db	0	;flags
+0971   F5D7             ;
+0972   F5D7             ;----------------------------------------------------------------
+0973   F5D7             ;scsi i/o address table	for read/write
+0974   F5D7             ;dont mess with this either
+0975   F5D7             s_iot:
+0976   F5D7             cur_tid:
+0977   F5D7 00          		.db	0	;target
+0978   F5D8 00          		.db	0	;unused
+0979   F5D9 D1 F5       		.dw	s_cdb	;cdb pointer
+0980   F5DB F5 F5       		.dw	s_stat	;status pointer
+0981   F5DD F9 F8       		.dw	dskbuf	;data out pointer
+0982   F5DF F9 F8       		.dw	dskbuf	;data in pointer
+0983   F5E1 F7 F5       		.dw	s_msg	;msg out pointer
+0984   F5E3 F7 F5       		.dw	s_msg	;msg in pointer
+0985   F5E5             ;
+TASM Z80 Assembler.               cbios.z80                        page 22
+CP/M Version 2.2 bios
+
+0986   F5E5             	.eject
+0987   F5E5             ;----------------------------------------------------------------
+0988   F5E5             ;this is the end of initialized data
+0989   F5E5             ;everything following must have memory space available
+0990   F5E5             ;but is not part of the boot image
+0991   F5E5             ;----------------------------------------------------------------
+0992   F5E5             ;
+0993   F5E5             ; uninitialized	data area
+0994   F5E5             ;
+0995   F5E5             track:		.ds	2	;track number
+0996   F5E7             sector:		.ds	2	;sector number
+0997   F5E9             dmaad:		.ds	2	;direct memory (buffer) address
+0998   F5EB             diskno:		.ds	1	;disk number 0-15
+0999   F5EC             ;
+1000   F5EC             req_tid:	.ds	1	;requested target id
+1001   F5ED             req_lun:	.ds	1	;requested lun
+1002   F5EE             req_lbn:	.ds	2	;requested logical block
+1003   F5F0             ;
+1004   F5F0             fl_dirty:	.ds	1	;buffer contains unwritten data
+1005   F5F1             record:		.ds	2	;requested record in disk buffer
+1006   F5F3             dsk_typ:	.ds	1	;selected disk type (f/h)
+1007   F5F4             wr_type:	.ds	1	;write type (imm/deffered)
+1008   F5F5             ;
+1009   F5F5             s_stat:		.ds	2	;scsi ending status
+1010   F5F7             s_msg:		.ds	2	;scsi message
+1011   F5F9             ;;
+1012   F5F9             ;	scratch ram area for bdos use
+1013   F5F9             begdat	.equ	$	 	;beginning of data area
+1014   F5F9             ;
+1015   F5F9             all00:	.ds	64	 	;allocation vector 0 (floppy)
+1016   F639             all01:	.ds	64	 	;allocation vector 1 (floppy)
+1017   F679             all02:	.ds	128	 	;allocation vector 2 (hard)
+1018   F6F9             all03:	.ds	128	 	;allocation vector 3 (hard)
+1019   F779             ;
+1020   F779             chk00:	.ds	64		;check vector 0
+1021   F7B9             chk01:	.ds	64		;check vector 1
+1022   F7F9             chk02:	.ds	64	 	;check vector 2 (not used)
+1023   F839             chk03:	.ds	64	 	;check vector 3 (not used)
+1024   F879             ;
+1025   F879             dirbf:	.ds	128	 	;scratch directory area
+1026   F8F9             ;
+1027   F8F9             enddat	.equ	$	 	;end of data area
+1028   F8F9             datsiz	.equ	$-begdat;	;size of data area
+1029   F8F9             ;
+1030   F8F9             dskbuf: .ds	512		;disk buffer for blocking/deblocking
+1031   FAF9             ;
+1032   FAF9             	.end
+1033   FAF9             
+tasm: Number of errors = 0
