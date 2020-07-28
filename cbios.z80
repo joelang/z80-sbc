@@ -1,0 +1,1027 @@
+;----------------------------------------------------------------
+;
+;	CP/M ver. 2.2 bios for sbc z80 board
+;	NCR5380 SCSI NS16550 serial
+;	J.C.Lang 12/15/2017
+;
+;	7/27/2020 fixed warms to not clear user number
+;----------------------------------------------------------------
+	.page
+	.title "CP/M Version 2.2 bios"
+;
+sysdsk	.equ	2		;system disk (C:)
+;
+ccp	.equ	0dc00h		;base of ccp
+bdos	.equ	0e406h		;bdos entry
+bios	.equ	0f200h		;base of bios
+curdsk	.equ	0004h		;address of current disk number
+iobyte	.equ	0003h		;intel i/o byte
+disks	.equ	04h		;number of disks in the system
+;
+	.org	bios		;origin of this program
+nsects	.equ	($-ccp)/512	;warm start sector count
+
+;----------------------------------------------------------------
+;io port addresses
+;----------------------------------------------------------------
+uart    .equ    $80		;NS16550 base address
+scsi    .equ    $88		;NCR5380 base address
+;
+;ncr 5380 i/o registers
+sr_csd	.equ	scsi		;current SCSI data
+sr_icr	.equ	scsi+$01	;initiator command
+sr_mr	.equ	scsi+$02	;mode
+sr_tcr	.equ	scsi+$03	;target command
+sr_csbs	.equ	scsi+$04	;current SCSI bus stat.
+sr_bsr	.equ	scsi+$05	;bus status
+sr_idr	.equ	scsi+$06	;initiator DMA recv.
+sr_rpi	.equ	scsi+$07	;reset parity/irq
+;
+;ncr 5380 output only registers
+sr_odr	.equ	scsi		;output data
+sr_ser	.equ	scsi+$04	;select enable
+sr_sds	.equ	scsi+$05	;start DMA send
+sr_sdtr	.equ	scsi+$06	;start target DMA recv.
+sr_sdir	.equ	scsi+$07	;start initiator DMA recv.
+;
+;SCSI current bus status bit masks
+sm_rst	.equ	$80		;reset
+sm_bsy	.equ	$40		;busy
+sm_req	.equ	$20		;request
+sm_msg	.equ	$10		;message
+sm_cd	.equ	$08		;cmd/data
+sm_io	.equ	$04		;in/out
+sm_sel	.equ	$02		;select
+sm_dbp	.equ	$01		;parity bit
+;
+sm_phm	.equ	$08		;phase match bit
+;
+	.eject
+;------------------------------------------------------------------------------
+;	jump vector for individual subroutines
+;
+	jp	boot	;cold start
+wboote:	jp	wboot	;warm start
+	jp	const	;console status
+	jp	conin	;console character in
+	jp	conout	;console character out
+	jp	list	;list character out
+	jp	punch	;punch character out
+	jp	reader	;reader character out
+	jp	home	;move head to home position
+	jp	seldsk	;select disk
+	jp	settrk	;set track number
+	jp	setsec	;set sector number
+	jp	setdma	;set dma address
+	jp	rd_rec	;read disk record
+	jp	wr_rec	;write disk record
+	jp	listst	;return list status
+	jp	sectran	;sector translate
+	jp	scsi_go	;direct scsi i/o
+	.eject
+;----------------------------------------------------------------
+;	fixed data tables for four drives
+;	a:,b: floppy 720k
+;	c:    hard disk
+;	d:    hard disk
+;
+dpbase:
+;	disk parameter header for disk 00
+	.dw	trans, 0000h
+	.dw	0000h, 0000h
+	.dw	dirbf, dpblk1
+	.dw	chk00, all00
+;
+;	disk parameter header for disk 01
+	.dw	trans, 0000h
+	.dw	0000h, 0000h
+	.dw	dirbf, dpblk1
+	.dw	chk01, all01
+;
+;	disk parameter header for disk 02
+	.dw	0000h, 0000h
+	.dw	0000h, 0000h
+	.dw	dirbf, dpblk0
+	.dw	chk02, all02
+;
+;	disk parameter header for disk 03
+	.dw	0000h, 0000h
+	.dw	0000h, 0000h
+	.dw	dirbf, dpblk0
+	.dw	chk03, all03
+
+;----------------------------------------------------------------
+;	sector translate table (floppy)
+trans:	.db	 1,  2,  3,  4	;sectors  1,  2,  3,  4
+	.db	13, 14, 15, 16	;sectors  5,  6,  7,  8
+	.db	25, 26, 27, 28	;sectors  9, 10, 11, 12
+	.db	 5,  6,  7,  8	;sectors 13, 14, 15, 16
+	.db	17, 18, 19, 20	;sectors 17, 18, 19, 20
+	.db	29, 30, 31, 32	;sectors 21, 22, 23, 24
+	.db	 9, 10, 11, 12	;sectors 25, 26. 27, 28
+	.db	21, 22, 23, 24	;sectors 29, 30, 31, 32
+	.db	33, 34, 35, 36	;sectors 33, 34, 35, 36
+	.eject
+;----------------------------------------------------------------
+;disk parameter block for hard disks.(8m)
+;block size=8k (BLS), 512 dir entries (DRM), 4 blocks for directory
+;15872 bytes reserved for system (31 disk blocks)
+;LBN 0 is reserved for boot loader
+dpblk0:
+	.dw	128		;SPT records per track
+	.db	6		;BSH block shift factor
+	.db	63		;BLM block mask
+	.db	3		;EXM null mask
+	.dw	1023		;DSM disk size-1
+	.dw	511		;DRM directory max-1
+	.db	0f0h		;AL0 alloc 0
+	.db	0		;AL1 alloc 1
+	.dw	0		;CKS check size
+	.dw	1		;OFF track offset
+;
+;----------------------------------------------------------------
+;disk parameter block for floppy disks. (720k)
+;block size=2k (BLS), 256 dir entries (DRM), 4 blocks for directory
+;8704 bytes reserved for system (17 disk blocks)
+;sector 1 is reserved for boot loader
+dpblk1:
+	.dw	36		;SPT records per track
+	.db	4		;BSH block shift factor
+	.db	15		;BLM block mask
+	.db	0		;EXM null mask
+	.dw	350		;DSM disk size-1
+	.dw	255		;DRM directory max
+	.db	0f0h		;AL0 alloc 0
+	.db	0		;AL1 alloc 1
+	.dw	64		;CKS check size
+	.dw	4		;OFF track offset
+
+;----------------------------------------------------------------
+;target/lun table
+;This table maps CP/M drive letters to target ID and LUN
+; 2 bytes per drive
+; 1st byte target id bit
+; 2nd byte lun (bits 7,6,5) ored with type (0=hd 1=fd))
+;
+tidlun:
+;drive a:
+	.db	1	;tid=0
+	.db	1	;lun=0 type=1 (floppy)
+;drive b:
+	.db	1	;tid=0
+	.db	$21	;lun=1 type=1 (floppy)
+;drive c:
+	.db	2	;tid=1
+	.db	0	;lun=0 type=0 (hard)
+;drive d:
+	.db	4	;tid=2
+	.db	0	;lun=0 type=0 (hard)
+	.eject
+;----------------------------------------------------------------
+; Cold boot
+; perform parameter initialization
+;
+boot:
+	xor	a		;zero in the accum
+	ld	(iobyte),a	;clear the iobyte
+	ld	(cur_tid),a	;mark buffer invalid
+	ld	(fl_dirty),a	;and not written
+	ld	a,sysdsk	;select system disk
+	ld	(curdsk),a	;set disk
+;
+gocpm:
+	ld 	a, 0c3h		;c3 is a jmp instruction
+	ld	(0),a		;for jmp to wboot
+	ld	hl, wboote	;wboot entry point
+	ld	(1),hl		;set address field for jmp at 0
+;
+	ld	(5),a		;for jmp to bdos
+	ld	hl, bdos	;bdos entry point
+	ld	(6),hl		;address field of jump at 5 to bdos
+;
+	ld	bc, 80h		;default dma address is 80h
+	call	setdma
+;
+	ld	a,(curdsk)	;get current disk number
+	and	0F0h		;mask to user bits
+	or	sysdsk		;force system disk
+	ld 	c, a		;send to the ccp
+	jp	ccp		;go to cp/m for further processing
+
+;----------------------------------------------------------------
+; Warm boot
+; load ccp and bdos into memory
+;
+wboot:
+	ld	sp, 80h		;use space below buffer for stack
+	ld 	c, sysdsk	;select system disk
+	call	seldsk		;
+	xor a
+	ld (cur_tid),a		;mark buffer invalid
+	ld (fl_dirty),a		;and not written
+;
+;setup wboot read
+	ld a,(req_lun)		;get boot lun
+	ld (s_wboot+1),a	;set it
+	ld a,(req_tid)		;get target id
+	ld ix,s_iobt		;point to boot io table
+	ld (ix),a		;set target id
+;
+;pointers all setup so do it.	
+	call scsi_go		;do scsi io
+	and 02h			;mask to error bit
+	jp z,gocpm		;read good so finish boot
+	jr wboot		;try again
+	.eject
+;----------------------------------------------------------------
+;	simple i/o handlers for ns16550
+;
+;----------------------------------------------------------------
+;console status, return 0ffh if character ready, 00h if not
+;
+const:
+	in 	a,(uart+5)	;get status
+	and 	01h		;check rxrdy bit
+	jp 	z,no_char
+	ld	a,0ffh		;char ready	
+	ret
+no_char:
+	ld	a,00h		;no char
+	ret
+
+;----------------------------------------------------------------
+;console character into register a
+;----------------------------------------------------------------
+;
+conin:
+	in 	a,(uart+5)	;get status
+	and 	01h		;check rxrdy bit
+	jp 	z,conin		;loop until char ready
+	in 	a,(uart)	;get char
+	and	7fh		;strip parity bit
+	ret
+
+;----------------------------------------------------------------
+;send character to punch device
+;(stub)
+;----------------------------------------------------------------
+;
+punch:
+;----------------------------------------------------------------
+;list character from register c
+;(stub)
+;----------------------------------------------------------------
+;
+list:
+;----------------------------------------------------------------
+;console character output from register c
+;----------------------------------------------------------------
+;
+conout:
+	in	a,(uart+5)
+	and	20h		;check txrdy bit
+	jp	z,conout	;loop until port ready
+	ld	a,c		;get the char
+	out	(uart),a	;out to port
+	ret
+
+;----------------------------------------------------------------
+;return list status (0 if not ready, 1 if ready)
+;(stub)
+;----------------------------------------------------------------
+;
+listst:
+	xor	a	 	;0 is always ok to return
+	ret
+
+;----------------------------------------------------------------
+;reader character into register a from reader device
+;(stub)
+;----------------------------------------------------------------
+;
+reader:
+	ld     a, 1ah		;return end of file (stub routine)
+	and    7fh		;strip parity bit
+	ret
+	.eject
+;----------------------------------------------------------------
+;	i/o drivers for the disk 
+; Drivers include sector blocking/deblocking
+; CP/M records (128B) are grouped 4 to a disk block (512B)
+; the low 2 bits of the CP/M sector number select the data
+; position in the disk buffer
+;----------------------------------------------------------------
+;
+;----------------------------------------------------------------
+; move to track 00
+;----------------------------------------------------------------
+;
+home:
+	ret			;not used
+
+;----------------------------------------------------------------
+; select disk given by register c
+; set requested TID,LUN and dsk_typ
+; return parameter header in HL
+;----------------------------------------------------------------
+;
+seldsk:
+	ld	hl, 0000h	;error return code
+	ld	de,tidlun	;point to tid table
+	ld 	a, c
+	ld	(diskno),a	;set disk number
+	cp	disks		;must be between 0 and 3
+	ret	nc		;return if bad drive num
+;
+; disk number is in the proper range
+; setup target id and lun
+	ld	a,(diskno)	;get disk number
+	ld 	l, a		;into hl
+	ld 	h, 0		;high order zero
+	add	hl,hl		;*2
+	add	hl,de		;make table index
+	ld	a,(hl)		;get target id
+	ld	(req_tid),a	;set requested target id
+	inc 	hl
+	ld	a,(hl)		;get target lun
+	and	$e0		;mask to lun bits
+	ld	(req_lun),a	;set lun
+	ld	a,(hl)		;get drive type
+	and	1		;mask to type bit
+	ld	(dsk_typ),a	;set disk type	
+;
+; compute proper disk parameter entry address
+; mult disk num by size of table entry (16Bytes)
+; add to base of table
+	ld	a,(diskno)
+	ld 	l, a		;l=disk number 0, 1, 2, 3
+	ld 	h, 0		;high order zero
+	add	hl,hl		;*2
+	add	hl,hl		;*4
+	add	hl,hl		;*8
+	add	hl,hl		;*16 (size of each table)
+	ld	de, dpbase
+	add	hl,de		;hl=dpbase+(diskno*16)
+	ret
+
+;----------------------------------------------------------------
+;set track given by register bc
+;----------------------------------------------------------------
+;
+settrk:
+	ld	(track),bc
+	ret
+
+;----------------------------------------------------------------
+;set sector given by register bc
+;----------------------------------------------------------------
+;
+setsec:
+	ld	(sector),bc
+	ret
+	.eject
+;----------------------------------------------------------------
+; sector translate
+;
+;set record based on low 2 bits of sector number
+;bits 0-1 of sector are where this record is in disk buffer
+;
+;translate the sector given by bc using the
+;translate table given by de
+;
+;no translation is done for hard disk
+;translated sector number in hl
+;----------------------------------------------------------------
+;
+sectran:
+	ld	a,c		;save record bits
+	and	3		;mask to record bits
+	ld	(record),a	;save it
+	ld	a,(dsk_typ)	;get disk type
+	and	1		;mask to type bit
+	jr	z,hsectrn	;jmp if hard disk
+;
+;floppy sectran routine (use trans table)
+	ex	de,hl		;table ptr into hl
+	add	hl,bc		;add sector num
+	ld 	l, (hl)		;get translated into hl
+	ld 	h, 0		;h is always 0
+	ret			;with value in hl
+;
+;hard disk sectran routine (no translation)
+hsectrn:
+	push bc
+	pop hl			;get sector
+	ret
+
+;----------------------------------------------------------------
+;set dma address given by register bc
+;----------------------------------------------------------------
+;
+setdma:
+	ld	(dmaad),bc	;save the address
+	ret
+	.eject
+;----------------------------------------------------------------
+;read one cp/m record (128 bytes) from disk buffer.
+;calls flush to write current disk block (if dirty) and
+; read requested disk block into buffer
+;copy record to user space
+;return 0h in register A if the operation completes properly
+;and 1h if an error occurs during the read.
+;----------------------------------------------------------------
+;
+rd_rec:
+	call flush	;write (if necessary) and read new block
+	ret nz		;error?
+	call mk_ptr	;point to disk data area in hl
+	ld de,(dmaad)	;destination pointer
+	ld bc,128	;byte count
+	ldir		;block move data to user
+	xor a		;update condition code
+	ret
+
+;----------------------------------------------------------------
+;write one cp/m record (128 bytes) to disk buffer.
+;calls flush to write current disk block (if dirty)
+;and pre read requested disk block into buffer
+;moves record to buffer and set dirty flag
+;then write to disk if wr_type=1 (directory record)
+;return  0h in register a if the operation completes properly
+;and 1h if an error occurs during the fush,preread or write
+;----------------------------------------------------------------
+;
+wr_rec:
+	ld a,c		;
+	ld (wr_type),a	;save write type
+;
+;write buffer if needed
+	call flush	;write buffer and pre-read if necessary
+	ret nz		;exit if error
+;
+;move record to buffer
+	call mk_ptr	;point to record in disk buffer
+	ex de,hl	;dest pointer to de
+	ld hl,(dmaad)	;source pointer
+	ld bc,128	;count
+	ldir		;move user data to buffer
+	ld a,$ff	;set dirty flag
+	ld (fl_dirty),a
+;
+;write buffer now if wr_type=1
+	ld a,(wr_type)	;get write type
+	and 1
+	jr z,not_imm	;dont write now?
+	call wr_phy
+	ld a,1		;preset error return code
+	ret nz		;exit if error
+	xor a		;no error return code
+	ld (fl_dirty),a	;clear dirty flag
+not_imm:
+	ret
+	.eject
+;----------------------------------------------------------------
+;Update sector buffer
+;if buffer = requested do nothing
+;else if dirty write to disk
+;read requested block into buffer
+;----------------------------------------------------------------
+;
+flush:
+	call ts2lbn		;convert track/sector to lbn
+;
+;see if requested is already in disk buffer
+;nothing to do if it matches
+	ld hl,req_tid
+	ld a,(cur_tid)		;check target id
+	cp (hl)
+	jr nz,notcur		;not currently in buffer
+;
+	inc hl
+	ld a,(cur_lun)		;check lun
+	cp (hl)
+	jr nz,notcur		;not currently in buffer
+;
+	inc hl
+	ld a,(cur_lbn)		;check block number (hi)
+	cp (hl)
+	jr nz,notcur		;not currently in buffer
+;
+	inc hl
+	ld a,(cur_lbn+1)	;check block number (low)
+	cp (hl)
+	jr nz,notcur		;not currently in buffer
+;
+;everything matched so record is currently in buffer
+;no write or preread required
+	xor a			;success
+	ret			;exit
+;
+;requested record is not in buffer
+notcur:
+;
+;is the current buffer valid?
+	ld a,(cur_tid)		;get TID
+	or a			;zero is not valid
+	jr z,setreq		;read if nothing in buf
+;
+;has the buffer been written? (dirty)
+	ld a,(fl_dirty)		;buffer written?
+	or a			;if buffer not written
+	jr z,setreq		;read if not dirty
+;
+;write the changed buffer to disk
+	call wr_phy		;write block to disk
+	ld a,01			;preset error code
+	ret nz			;error? then exit
+;
+;setup parameters for requested sector
+setreq:
+	ld a,(req_tid)		;change to requested
+	ld (cur_tid),a		;target
+	ld a,(req_lun)
+	ld (cur_lun),a		;LUN LBN hi
+	ld a,(req_lbn)
+	ld (cur_lbn),a		;LBN mid
+	ld a,(req_lbn+1)
+	ld (cur_lbn+1),a	;LBN low
+;
+;pre-read requested sector
+	call rd_phy		;read block from disk
+	ld a,0			;preset return value
+	ld (fl_dirty),a		;clear buffer written
+	ret z			;Z=success
+;
+;read failed so invalidate buffer
+	ld (cur_tid),a		;invalidate buffer
+	ld a,1			;error response
+	ret			;NZ=error
+	.eject
+;----------------------------------------------------------------
+;write logical block to disk
+;cur_tid,cur_lun,cur_lbn already set
+;exit with zero status if ok
+;----------------------------------------------------------------
+;
+wr_phy:
+	ld a,0ah		;write command
+	jr phy_com		;finish same as read
+
+;----------------------------------------------------------------
+;read logical block from disk
+;cur_tid,cur_lun,cur_lbn already set
+;exit with zero status if ok
+;----------------------------------------------------------------
+;
+rd_phy:
+	ld a,8			;read command
+phy_com:
+	ld (s_cdb),a		;set in command block
+	ld ix,s_iot		;point to io table
+	call scsi_go
+	and 02h			;mask to error bit
+	ret
+
+;----------------------------------------------------------------
+;convert track/sector to LBN (logical block number)
+;req_lun,dsk_typ,track,sector set on entry
+;req_lun,req_lbn updated on exit
+;----------------------------------------------------------------
+;
+ts2lbn:
+	ld a,(dsk_typ)		;branch on disk type
+	and 1			;mask to FD bit
+	jr z,hconv		;goto hard disk
+
+;
+;----------------------------------------------------------------
+;floppy disk LBN conversion
+;divide requested record by 4 (4 cp/m records per sector) 
+;mult track by 9 and add sector/4=lbn
+;
+fconv:
+	ld a,(sector)		;get desired sector
+	dec a			;make sector zero based
+	srl a			;divide by 4
+	srl a
+	ld c,a			;save result in bc
+	ld b,0
+;
+;multiply track by 9 (phy sectors per track)
+	ld hl,(track)		;get track in hl
+	push hl
+	pop de			;get track in de
+	add hl,hl		;times 2
+	add hl,hl		;times 4
+	add hl,hl		;times 8
+	add hl,de		;plus de=times 9
+	add hl,bc		;plus sector=lbn
+;
+	ld b,0			;B=LBA hi=0
+	ld c,h			;H into LBA mid
+	ld e,l			;L into LBA low
+	jr set_req
+;
+;----------------------------------------------------------------
+;hard disk conversion
+hconv:
+	ld a,(sector)
+	rla			;line up sector to msb
+	ld e,a			;save it
+	ld bc,(track)		;get requested track
+;
+;shift bc,e right 3 places (track/sector)
+;or in the lun bits into b
+;this will divide sector by 4
+;filling hi bits with track bits
+;resulting LBN= lllt tttt  tttt tttt  ttts ssss
+;              |    B    ||    C    ||    E    |
+	srl b
+	rr c
+	rr e
+	srl b
+	rr c
+	rr e
+	srl b
+	rr c
+	rr e
+;
+;----------------------------------------------------------------
+;set req_lun,req_lbn with values in B,C,E
+;
+set_req:
+;
+;or LUN bits into LBA hi
+	ld a,(req_lun)		;get LUN bits
+	and 0e0h		;mask to lun bits
+	or b			;set high addr
+;
+;put LUN/LBA in requested
+	ld (req_lun),a		;set lba hi and lun
+	ld a,c			;get mid
+	ld (req_lbn),a		;save lba mid
+	ld a,e			;get low
+	ld (req_lbn+1),a	;save lba low
+	ret
+	.eject
+;----------------------------------------------------------------
+;make pointer to cp/m record in disk buffer
+;----------------------------------------------------------------
+;
+mk_ptr:
+	ld de,128		;size of record
+	ld hl,dskbuf-128	;point to buffer-128
+	ld a,(record)		;(0-3)
+	inc a			;always do loop once
+ptr_loop:
+	add hl,de		;advance to next record
+	dec a
+	jr nz,ptr_loop		;loop till proper record
+	ret			;return pointer in hl
+	.eject
+;-------------------------------------------------------------------------------
+;do scsi transaction
+; ix=scsi io block
+;-------------------------------------------------------------------------------
+scsi_go:
+	ld a,$ff	;preset error status
+	ld l,(ix+4)	;point to status address
+	ld h,(ix+5)	;point to status address
+	ld (hl),a	;set error
+;
+	xor a		;
+	out (sr_mr),a	;reset control reg
+	out (sr_tcr),a	;clear command reg.
+	out (sr_icr),a	;
+	ld a,(ix)	;get tid
+	out (sr_odr),a	;set target id
+	ld a,$01	;drive bus
+	out (sr_icr),a	;
+	ld a,$05	;set sel and drive bus
+	out (sr_icr),a	;
+;
+;wait for scsi busy
+	ld bc,0		;init timeout
+s_swt:
+	in a,(sr_csbs)	;get bus status
+	and sm_bsy	;mask to busy bit
+	jr nz,s_bsya	;jmp if busy active
+	nop		;kill a little time
+	nop
+	nop
+	nop
+	dec bc		;dec timeout
+	ld a,b		;test timeout=0
+	or c
+	jr nz,s_swt	;jmp if no timeout
+	xor a		;clear a
+	out (sr_icr),a	;clear sel and data
+	jr s_exit	;error exit
+;
+;busy is active
+s_bsya:
+	xor a		;clear a
+	out (sr_icr),a	;clear sel and data
+
+;-------------------------------------------------------------------------------
+;
+;target is selected so test bsy and req
+;then decode requested phase
+;
+;-------------------------------------------------------------------------------
+phase:
+	xor a
+	out (sr_icr),a	;reset initiator
+;
+s_wtreq:
+	in a,(sr_csbs)	;get bus status
+	ld b,a		;save copy
+	and sm_bsy	;mask to busy bit
+	jr nz,s_wtrq1	;still busy so cont.
+
+;-------------------------------------------------------------------------------
+;busy lost so exit
+;-------------------------------------------------------------------------------
+s_exit:
+	ld l,(ix+4)	;get status pointer
+	ld h,(ix+5)	;get status pointer
+	ld a,(hl)
+	ret		;busy lost? were done
+;
+s_wtrq1:
+	ld a,b		;recover status
+	and sm_req	;request active?
+	jr z,s_wtreq	;loop till request
+
+;-------------------------------------------------------------------------------
+;request is active so set 5380 to requested phase
+;-------------------------------------------------------------------------------
+	ld a,b		;recover bus status
+	rr a		;shift status to phase bits
+	rr a
+	and $07		;mask to phase bits
+	out (sr_tcr),a	;set phase
+;
+;jump to phase handler
+;
+	ld a,b		;recover bus status 
+	rr a
+	and $0e		;mask to phase bits
+	ld e,a		;
+	ld d,0
+	ld hl,phtabl	;point to table
+	add hl,de	;offset into table
+	ld e,(hl)	;get execution address
+	inc hl
+	ld d,(hl)
+	push de
+	ret		;execute phase
+
+;-------------------------------------------------------------------------------
+;phase table
+;-------------------------------------------------------------------------------
+phtabl:
+	.word	phase0	;data out
+	.word	phase1	;data in
+	.word	phase2	;cmd out
+	.word	phase3	;status in
+	.word	s_exit	;unused
+	.word	s_exit	;unused
+	.word	phase6	;message out
+	.word	phase7	;message in
+
+;-------------------------------------------------------------------------------
+;phase handlers
+;-------------------------------------------------------------------------------
+;
+;data out
+phase0:
+	ld l,(ix+6)	;get pointer
+	ld h,(ix+7)
+	jp s_writ	;write bytes
+;
+;data in
+phase1:
+	ld l,(ix+8)	;get pointer
+	ld h,(ix+9)
+	jp s_read	;read bytes
+;
+;cmd out
+phase2:
+	ld l,(ix+2)
+	ld h,(ix+3)
+	jp s_writ
+;
+;status in
+phase3:
+	ld l,(ix+4)
+	ld h,(ix+5)
+	jp s_read
+;
+;msg out
+phase6:
+	ld l,(ix+10)
+	ld h,(ix+11)
+	jp s_writ
+;
+;msg in
+phase7:
+	ld l,(ix+12)
+	ld h,(ix+13)
+	jp s_read
+	.eject
+;-------------------------------------------------------------------------------
+;scsi write routine (send bytes to target)
+;bus phase already set. return on phase mismatch 
+;-------------------------------------------------------------------------------
+s_writ:
+	ld a,1		;drive scsi data bus
+	out (sr_icr),a
+;
+;wait for req while checking busy
+;
+s_wwreq:
+        in a,(sr_csbs)  ;get current bus stat
+        ld b,a          ;save it
+        and sm_req      ;request active?
+        jr nz,s_wnxt    ;
+;
+        ld a,b          ;recover current bus stat
+        and sm_bsy      ;still busy?
+        jp nz,s_wwreq   ;loop if still busy
+        jp phase        ;
+;
+;request active so check phase
+;
+s_wnxt:
+        in a,(sr_bsr)   ;get status
+        and sm_phm      ;mask to phase match
+        jp z,phase      ;jmp if phase mismatch
+;
+;request active and phase match so send data
+;
+	ld a,(hl)	;get byte
+	out (sr_odr),a	;send data
+	ld a,$11	;ack + drive bus
+	out (sr_icr),a	;set ack,drive scsi bus
+	inc hl		;advance buf pointer
+;
+;wait for request to drop
+;
+s_wnreq:
+	in a,(sr_csbs)	;get current status
+	and sm_req
+	jr nz,s_wnreq	;loop till req drops
+;
+	ld a,$1		;drop ack,assert data
+	out (sr_icr),a	;drop ack
+	jp s_wwreq	;loop for next byte/phase
+	.eject
+;-------------------------------------------------------------------------------
+;scsi read routine (get bytes from target)
+;bus phase already set. return on phase mismatch 
+;-------------------------------------------------------------------------------
+;
+s_read:
+;
+;wait for req while checking busy
+;
+s_rwreq:
+        in a,(sr_csbs)  ;get current bus stat
+        ld b,a          ;save it
+        and sm_req      ;request active?
+        jr nz,s_rnxt    ;
+;
+        ld a,b          ;recover current bus stat
+        and sm_bsy      ;still busy?
+        jp nz,s_rwreq   ;loop if stil busy
+        jp phase        ;
+;
+;request active so check phase
+s_rnxt:
+        in a,(sr_bsr)   ;get status
+        and sm_phm      ;mask to phase match
+        jp z,phase      ;jmp if phase mismatch
+
+;request active and phase match so get data
+;
+	in a, (sr_csd)	;get data
+	ld (hl),a	;save data
+	ld a,$10
+	out (sr_icr),a	;set ack
+	inc hl		;advance buf pointer
+;
+;wait for request to drop
+;
+s_rnreq:
+	in a,(sr_csbs)	;get current status
+	and sm_req
+	jr nz,s_rnreq	;loop till req drops
+	xor a
+	out (sr_icr),a	;drop ack
+	jp s_read	;loop for next byte/phase
+
+	.eject
+;----------------------------------------------------------------
+; initialized data area
+;----------------------------------------------------------------
+;scsi command descriptor for wboot
+;read "nsects" (512 byte) blocks starting at lbn 1
+;and put at "ccp"
+;
+s_wboot:
+		.db	8	;command (read)
+		.db	0	;lun/lbn hi
+		.db	0	;lbn mid
+		.db	1	;lbn low
+		.db	nsects	;count
+		.db	0	;flags
+;
+;----------------------------------------------------------------
+;scsi i/o address table for wboot
+s_iobt:
+		.db	0	;target ID (filled in by wboot)
+		.db	0	;unused
+		.dw	s_wboot	;cdb pointer
+		.dw	s_stat	;status pointer
+		.dw	ccp	;data out pointer
+		.dw	ccp	;data in pointer
+		.dw	s_msg	;msg out pointer
+		.dw	s_msg	;msg in pointer
+
+;----------------------------------------------------------------
+;scsi command descriptor for read/write
+;do not use this for direct scsi i/o
+;you will mess up block/deblock
+s_cdb:	
+		.db	8	;command
+cur_lun:
+		.db	0	;lun/lba hi
+cur_lbn:
+		.db	0	;lba mid
+		.db	0	;lba low
+		.db	1	;count
+		.db	0	;flags
+;
+;----------------------------------------------------------------
+;scsi i/o address table	for read/write
+;dont mess with this either
+s_iot:
+cur_tid:
+		.db	0	;target
+		.db	0	;unused
+		.dw	s_cdb	;cdb pointer
+		.dw	s_stat	;status pointer
+		.dw	dskbuf	;data out pointer
+		.dw	dskbuf	;data in pointer
+		.dw	s_msg	;msg out pointer
+		.dw	s_msg	;msg in pointer
+;
+	.eject
+;----------------------------------------------------------------
+;this is the end of initialized data
+;everything following must have memory space available
+;but is not part of the boot image
+;----------------------------------------------------------------
+;
+; uninitialized	data area
+;
+track:		.ds	2	;track number
+sector:		.ds	2	;sector number
+dmaad:		.ds	2	;direct memory (buffer) address
+diskno:		.ds	1	;disk number 0-15
+;
+req_tid:	.ds	1	;requested target id
+req_lun:	.ds	1	;requested lun
+req_lbn:	.ds	2	;requested logical block
+;
+fl_dirty:	.ds	1	;buffer contains unwritten data
+record:		.ds	2	;requested record in disk buffer
+dsk_typ:	.ds	1	;selected disk type (f/h)
+wr_type:	.ds	1	;write type (imm/deffered)
+;
+s_stat:		.ds	2	;scsi ending status
+s_msg:		.ds	2	;scsi message
+;;
+;	scratch ram area for bdos use
+begdat	.equ	$	 	;beginning of data area
+;
+all00:	.ds	64	 	;allocation vector 0 (floppy)
+all01:	.ds	64	 	;allocation vector 1 (floppy)
+all02:	.ds	128	 	;allocation vector 2 (hard)
+all03:	.ds	128	 	;allocation vector 3 (hard)
+;
+chk00:	.ds	64		;check vector 0
+chk01:	.ds	64		;check vector 1
+chk02:	.ds	64	 	;check vector 2 (not used)
+chk03:	.ds	64	 	;check vector 3 (not used)
+;
+dirbf:	.ds	128	 	;scratch directory area
+;
+enddat	.equ	$	 	;end of data area
+datsiz	.equ	$-begdat;	;size of data area
+;
+dskbuf: .ds	512		;disk buffer for blocking/deblocking
+;
+	.end
+
