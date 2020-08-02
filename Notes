@@ -1,0 +1,138 @@
+Things that might help:
+
+The board is a z80 system with 64k SRAM and 8K EEPROM.
+
+ROM 0000-1FFFh
+RAM 2000-FFFFh
+to switch to all RAM write to IO port 00-7Fh (can't switch back)
+
+it has serial rs232 (ns16550) and SCSI (z53c80)
+
+NS16550 80-87h
+Z53c80  88-8Fh
+
+The serial connector P4 is pinned out like the 10 pin PC standard (DTE)
+default 9600,8,n,1
+
+The power connector P2 is pinned out the same as the 3.5 in. floppy disk.
+Only 5 volt and ground is used.
+
+Jumpers:
+W1 always installed for 28c64a
+W2 serial interrupt open for my provided code
+W3 SCSI interrupt also open
+
+Code:
+sbc-mon is a simple ROM monitor configured  to the board's hardware.
+
+cboot is the second stage boot loader. it is loaded to 8000h by
+the "B" command in the monitor. The monitor jumps to 8000h if the load
+was successfull. it is located on target id 1 LUN 0 LBN 0
+and is 1 block in size.
+
+cboot reads LBNs 1 through 14 to address DC00h. If successful it flips 
+the memory map to all RAM  then jumps to F200h (cold start)
+It returns to the monitor if the load is unsuccessful.
+
+cbios is configured for 4 drives:
+a: TID 0 LUN 0 720K Floppy (80Track 2Sides 9 Sectors) DSDD
+b: TID 0 LUN 1 720K Floppy (80Track 2Sides 9 Sectors) DSDD
+c: TID 1 LUN 0 8M hard disk 
+d: TID 2 LUN 0 8M hard disk
+
+CP/M 128 byte records are blocked/unblocked into 512 byte sectors
+
+The TIDs ,LUNs and type (hard/floppy) are configured in a table (tidlun)
+in the cbios. The system boots to the "C:" drive.
+
+I expect most will not have SCSI floppy drives.
+ (see my scsi-floppy project to fix that)
+
+The cbios does not implement IOBYTE since it only has 1 port.
+
+cpm22 is a execelent disassembly of the original DRI code. I made some
+changes to assemble with TASM and allow drives other than "A:" to be
+the system disk. (see SYSDSK in cpm22)
+
+Building a system disk:
+Many ways to skin this cat...
+
+cpmtools is the simplest way to get a running system.
+
+You will need this in cpmtools diskdef:
+
+diskdef cfcard
+  seclen 512
+  tracks 512
+  sectrk 32
+  blocksize 8192
+  maxdir 512
+  skew 1
+  boottrk 1
+  os 2.2
+end
+
+I have provided a bootable disk image. (cpm22.img) 
+Use cpmtools to add any CP/M tools/utilities to the disk image and
+copy the image to your physical media. I used dd for this.
+The image will work for SCSI-CFcard or spinning rust.
+
+If you want to change the cbios or cpm its more complicated.
+You you use the monitor to load each hex file into RAM and then
+use the SCSI tools (N) command to write to disk.
+You manually edit the CDB and pointers.
+
+>N execute SCSI tools
+:I Initialize CDB and pointers
+:C Edit command block
+
+This is the command block and pointers in memory
+
+FE00/ 08-  command 08 read 0A write
+FE01/ 00-  starting block number
+FE02/ 00- 
+FE03/ 00- 
+FE04/ 01-  block count
+FE05/ 00- 
+FE06/ 00- 
+FE07/ 00- 
+FE08/ 00- 
+FE09/ 00- 
+FE0A/ 00- 
+FE0B/ 00- 
+FE0C/ 02-  target ID
+FE0D/ 00- 
+FE0E/ 00-  CDB pointer low
+FE0F/ FE-  CDB pointer hi
+FE10/ 1E-  return status low
+FE11/ FE-  return status hi
+FE12/ 00-  data pointer write low
+FE13/ 80-  data pointer write hi
+FE14/ 00-  data pointer read low
+FE15/ 80-  data pointer read hi
+FE16/ 1C- 
+FE17/ FE- 
+FE18/ 1A- 
+FE19/ FE- 
+
+For example to reinstall cboot, use the monitor to load the object file
+edit the first byte of the CDB to 0A (write) then execute the command.
+
+Same for cpm. Load cpm22 then cbios 
+Set command to 0A
+block number to 00 00 01
+count to 0D
+data pointers to DC00
+then execute
+
+You can also install the original system this way but be sure to fill the 
+directory with E5 pattern.
+
+I guess I should have done a sysgen and format, but all the needed
+functions are already in the monitor rom and how often do you format 
+a hard disk anyway.
+
+The floppy format is the same as the PC (720K) so I dont need to format them
+ either. MY SCSI-Floppy does format 720K disks so the monitor rom can do 
+low level floppy format if needed.
+
